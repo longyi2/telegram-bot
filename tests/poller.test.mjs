@@ -474,3 +474,254 @@ test("log safety: bot token never appears in any log output during poller constr
   const leaked = logs.find((l) => l.includes(SECRET_TOKEN));
   assert.equal(leaked, undefined, `Bot token leaked into a log line: ${leaked}`);
 });
+
+// ── Metrics integration ───────────────────────────────────────────────────────
+//
+// These tests verify that the poller increments the metrics counters in the
+// expected situations. We supply a fake metrics registry (a plain object with
+// the same shape) so there is no HTTP server involved — the tests are purely
+// in-memory and deterministic.
+//
+// The strategy:
+//   - Supply a fake metrics object that records every inc()/set() call.
+//   - Drive the poller through observable failure paths (failing server,
+//     stale cursor) and confirm the right counters are incremented.
+//   - For paths that require a full poll cycle (RPC errors, consecutive
+//     failures gauge), drive via the circuit-breaker test pattern already
+//     used above.
+
+function makeMetrics() {
+  return {
+    pollCycles: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    rpcRequests: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    rpcErrors: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    eventsDecoded: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    eventsSkipped: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    notificationsSent: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    notificationsFailed: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    staleCursorEvents: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
+    consecutiveFailures: { _value: 0, set(v) { this._value = v; }, value() { return this._value; } },
+    render() { return ""; },
+    startServer() { return Promise.resolve({ port: 0, close: () => Promise.resolve() }); },
+  };
+}
+
+test("metrics: pollCycles is incremented once per poll cycle", async () => {
+  const tmpDir = await import("node:os").then(os => import("node:path").then(p =>
+    import("node:fs/promises").then(fs => fs.mkdtemp(p.join(os.tmpdir(), "poller-metrics-")))
+  ));
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
+  const cursorFile = path.join(dir, "cursor.json");
+
+  const metrics = makeMetrics();
+
+  // A server that always succeeds with empty results
+  const goodServer = {
+    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
+    getEvents: async () => ({ events: [], cursor: "0000000100000000-0", latestLedger: 5_000_000 }),
+  };
+
+  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
+  const poller = createPoller({ config, server: goodServer, send: async () => {}, metrics });
+
+  try {
+    poller.start();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    poller.stop();
+    assert.ok(metrics.pollCycles.value() >= 1, `Expected pollCycles >= 1; got ${metrics.pollCycles.value()}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metrics: rpcErrors incremented when server throws", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
+  const cursorFile = path.join(dir, "cursor.json");
+
+  const metrics = makeMetrics();
+
+  const failingServer = {
+    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
+    getEvents: async () => { throw new Error("RPC down"); },
+  };
+
+  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
+  const poller = createPoller({ config, server: failingServer, send: async () => {}, metrics });
+
+  try {
+    poller.start();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    poller.stop();
+    assert.ok(metrics.rpcErrors.value() >= 1, `Expected rpcErrors >= 1; got ${metrics.rpcErrors.value()}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metrics: consecutiveFailures gauge reflects current consecutive failure count", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
+  const cursorFile = path.join(dir, "cursor.json");
+
+  const metrics = makeMetrics();
+
+  const failingServer = {
+    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
+    getEvents: async () => { throw new Error("RPC down"); },
+  };
+
+  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
+  const poller = createPoller({ config, server: failingServer, send: async () => {}, metrics });
+
+  const origError = console.error;
+  const origWarn = console.warn;
+  console.error = () => {};
+  console.warn = () => {};
+
+  try {
+    poller.start();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    poller.stop();
+    assert.ok(
+      metrics.consecutiveFailures.value() >= 1,
+      `Expected consecutiveFailures >= 1; got ${metrics.consecutiveFailures.value()}`,
+    );
+  } finally {
+    console.error = origError;
+    console.warn = origWarn;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metrics: consecutiveFailures gauge resets to 0 after a successful cycle", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
+  const cursorFile = path.join(dir, "cursor.json");
+
+  const metrics = makeMetrics();
+
+  // First fail, then succeed
+  let callCount = 0;
+  const mixedServer = {
+    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
+    getEvents: async () => {
+      callCount++;
+      if (callCount <= 2) throw new Error("RPC down"); // market + squad both fail first cycle
+      return { events: [], cursor: "0000000100000000-0", latestLedger: 5_000_000 };
+    },
+  };
+
+  // Use a very short poll interval so the second cycle runs quickly
+  const config = makeConfig({ cursorFile, pollIntervalMs: 50 });
+  const poller = createPoller({ config, server: mixedServer, send: async () => {}, metrics });
+
+  const origError = console.error;
+  const origWarn = console.warn;
+  console.error = () => {};
+  console.warn = () => {};
+
+  try {
+    poller.start();
+    // Wait for at least 2 cycles: first fails, second succeeds
+    await new Promise(resolve => setTimeout(resolve, 400));
+    poller.stop();
+
+    // After a successful cycle, consecutiveFailures should be 0
+    assert.equal(
+      metrics.consecutiveFailures.value(),
+      0,
+      `Expected consecutiveFailures=0 after success; got ${metrics.consecutiveFailures.value()}`,
+    );
+  } finally {
+    console.error = origError;
+    console.warn = origWarn;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metrics: staleCursorEvents incremented when cursor is stale", async () => {
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
+  const cursorFile = path.join(dir, "cursor.json");
+
+  const metrics = makeMetrics();
+
+  // Write a stale cursor (ledger 100_000, but server retains from 200_000)
+  const cursorLedger = 100_000;
+  const toid = BigInt(cursorLedger) << 32n;
+  const staleCursor = `${toid.toString().padStart(19, "0")}-4294967295`;
+
+  await writeFile(cursorFile, JSON.stringify({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    targets: {
+      market: { cursor: staleCursor, lastEventLedger: cursorLedger },
+      squad: { cursor: staleCursor, lastEventLedger: cursorLedger },
+    },
+  }), "utf8");
+
+  const staleServer = {
+    getHealth: async () => ({ status: "healthy", oldestLedger: 200_000, latestLedger: 300_000 }),
+    getEvents: async () => ({ events: [], cursor: staleCursor, latestLedger: 300_000 }),
+  };
+
+  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
+  const poller = createPoller({ config, server: staleServer, send: async () => {}, metrics });
+
+  const origWarn = console.warn;
+  console.warn = () => {};
+
+  try {
+    poller.start();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    poller.stop();
+
+    assert.ok(
+      metrics.staleCursorEvents.value() >= 1,
+      `Expected staleCursorEvents >= 1; got ${metrics.staleCursorEvents.value()}`,
+    );
+  } finally {
+    console.warn = origWarn;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metrics: poller works correctly when metrics is undefined (backwards compat)", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
+  const cursorFile = path.join(dir, "cursor.json");
+
+  const goodServer = {
+    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
+    getEvents: async () => ({ events: [], cursor: "0000000100000000-0", latestLedger: 5_000_000 }),
+  };
+
+  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
+  // No metrics supplied — should not throw
+  const poller = createPoller({ config, server: goodServer, send: async () => {} });
+
+  try {
+    poller.start();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    poller.stop();
+    // If we got here without an exception, the poller handled undefined metrics gracefully
+    const s = poller.status();
+    assert.ok(s.cycles >= 1, `Expected cycles >= 1; got ${s.cycles}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

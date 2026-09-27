@@ -33,6 +33,12 @@ export interface BotConfig extends StellarConfig {
   maxNotificationsPerCycle: number;
   /** Milliseconds to wait between successive Telegram sends in one cycle. */
   interSendDelayMs: number;
+  /**
+   * TCP port for the optional Prometheus metrics HTTP server (`/metrics`).
+   * `null` means the server is disabled (default when `METRICS_PORT` is unset).
+   * Must be in 1–65535 when set.
+   */
+  metricsPort: number | null;
 }
 
 export class ConfigError extends Error {
@@ -136,6 +142,25 @@ function collector() {
       }
       return value;
     },
+
+    /**
+     * Parse an optional TCP port number. Returns `null` when the env var is
+     * absent/empty (server disabled). Validates 1–65535 when present.
+     */
+    optionalPort(name: string): number | null {
+      const raw = read(name);
+      if (raw === undefined) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+        problems.push(`${name} must be an integer port number (1–65535); got "${raw}"`);
+        return null;
+      }
+      if (parsed < 1 || parsed > 65_535) {
+        problems.push(`${name} must be between 1 and 65535; got ${parsed}`);
+        return null;
+      }
+      return parsed;
+    },
   };
 }
 
@@ -179,6 +204,7 @@ export function loadConfig(): BotConfig {
       DEFAULTS.interSendDelayMs,
       DEFAULTS.minInterSendDelayMs,
     ),
+    metricsPort: c.optionalPort("METRICS_PORT"),
   };
 
   if (c.problems.length > 0) throw new ConfigError(c.problems);

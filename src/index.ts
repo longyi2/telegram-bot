@@ -10,6 +10,8 @@ import { ConfigError, loadConfig, networkLabel } from "./config.js";
 import { createBot, createNotifier, registerCommands } from "./bot.js";
 import { createPoller } from "./poller.js";
 import { createRpcServer } from "./stellar/client.js";
+import { createMetrics } from "./metrics.js";
+import type { MetricsServer } from "./metrics.js";
 
 /**
  * Installed before anything else can throw, so a rejection during startup is
@@ -42,6 +44,26 @@ async function main(): Promise<void> {
   console.log(`[boot] chat         ${config.chatId}`);
   console.log(`[boot] cursor file  ${config.cursorFile}`);
 
+  // ── Metrics ────────────────────────────────────────────────────────────────
+  // Create the registry unconditionally; the HTTP server is only started when
+  // METRICS_PORT is configured. This means the poller always has a metrics
+  // object to call — no null checks needed there.
+  const metrics = createMetrics();
+
+  let metricsServer: MetricsServer | null = null;
+  if (config.metricsPort !== null) {
+    try {
+      metricsServer = await metrics.startServer(config.metricsPort);
+    } catch (err) {
+      // Metrics are optional. A port conflict or privilege error must not
+      // prevent the bot from starting — just log and continue.
+      console.error(
+        `[boot] metrics server failed to start on port ${config.metricsPort}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   const server = createRpcServer(config);
 
   // One read before announcing readiness: a wrong RPC URL should surface now,
@@ -58,7 +80,7 @@ async function main(): Promise<void> {
     throw new Error("telegram notifier not ready");
   };
 
-  const poller = createPoller({ config, server, send: (text) => notify(text) });
+  const poller = createPoller({ config, server, send: (text) => notify(text), metrics });
   const bot = createBot({ config, status: () => poller.status() });
   notify = createNotifier(bot, config);
 
@@ -81,7 +103,9 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     console.log(`[shutdown] ${signal} received, stopping`);
     poller.stop();
-    void bot.stop().finally(() => process.exit(0));
+    const stopBot = bot.stop().finally(() => process.exit(0));
+    const stopMetrics = metricsServer ? metricsServer.close() : Promise.resolve();
+    void Promise.all([stopBot, stopMetrics]);
   };
 
   process.once("SIGINT", () => shutdown("SIGINT"));

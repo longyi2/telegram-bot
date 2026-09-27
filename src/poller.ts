@@ -32,6 +32,7 @@ import type { BotConfig } from "./config.js";
 import { clip, formatEvent } from "./notifications/format.js";
 import { eventCursorLedger, readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
+import type { Metrics } from "./metrics.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -69,6 +70,12 @@ export interface PollerDeps {
   server: rpc.Server;
   /** Sends one already-formatted MarkdownV2 message. May reject. */
   send: (text: string) => Promise<void>;
+  /**
+   * Optional metrics registry. When provided, the poller increments counters
+   * on every observable event. When absent (e.g. in tests that don't need it),
+   * the poller behaves identically but emits no metrics.
+   */
+  metrics?: Metrics | undefined;
 }
 
 /**
@@ -96,6 +103,7 @@ function errMessage(err: unknown): string {
 
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
+  const metrics = deps.metrics;
 
   const targets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
@@ -232,6 +240,7 @@ export function createPoller(deps: PollerDeps) {
             `Events in the gap will not be posted. ` +
             `Delete ${config.cursorFile} to cold-start and resume from the current tip.`,
         );
+        metrics?.staleCursorEvents.inc();
       }
     }
   }
@@ -242,8 +251,11 @@ export function createPoller(deps: PollerDeps) {
     let sentThisCycle = 0;
 
     for (const event of events) {
+      metrics?.eventsDecoded.inc();
+
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
+        metrics?.eventsSkipped.inc();
         // Clip the event name and reason: these come from remote contract data
         // and must not produce unbounded log output.
         const safeName = clip(event.payload.eventName ?? "", 80);
@@ -258,11 +270,13 @@ export function createPoller(deps: PollerDeps) {
       const text = formatEvent(config, event);
       if (text === null) {
         status.eventsSkipped += 1;
+        metrics?.eventsSkipped.inc();
         continue;
       }
 
       if (sentThisCycle >= config.maxNotificationsPerCycle) {
         status.eventsSkipped += 1;
+        metrics?.eventsSkipped.inc();
         // Log clearly that the cap was reached, not just that an event was dropped.
         if (sentThisCycle === config.maxNotificationsPerCycle) {
           console.warn(
@@ -278,10 +292,12 @@ export function createPoller(deps: PollerDeps) {
       try {
         await send(text);
         status.notificationsSent += 1;
+        metrics?.notificationsSent.inc();
         sentThisCycle += 1;
       } catch (err) {
         // One bad send must not abort the rest of the batch.
         status.notificationsFailed += 1;
+        metrics?.notificationsFailed.inc();
         console.error(
           `[poller] send failed for ${event.payload.name} at ledger ${event.ledger}: ` +
             errMessage(err),
@@ -301,6 +317,7 @@ export function createPoller(deps: PollerDeps) {
     inFlight = true;
     status.cycles += 1;
     status.lastPollAt = Date.now();
+    metrics?.pollCycles.inc();
 
     let anyOk = false;
 
@@ -318,6 +335,7 @@ export function createPoller(deps: PollerDeps) {
         status.oldestLedger = scan.oldestLedger;
         current.lastError = null;
         anyOk = true;
+        metrics?.rpcRequests.inc();
 
         // Warn if this cursor is already behind the RPC's retention window.
         checkStaleCursors(scan.oldestLedger);
@@ -337,6 +355,7 @@ export function createPoller(deps: PollerDeps) {
         const message = errMessage(err);
         current.lastError = message;
         status.lastError = { at: Date.now(), message: `${target.source}: ${message}` };
+        metrics?.rpcErrors.inc();
         console.error(`[poller] ${target.source} scan failed: ${message}`);
       }
     }
@@ -344,8 +363,10 @@ export function createPoller(deps: PollerDeps) {
     if (anyOk) {
       status.lastSuccessAt = Date.now();
       status.consecutiveFailures = 0;
+      metrics?.consecutiveFailures.set(0);
     } else {
       status.consecutiveFailures += 1;
+      metrics?.consecutiveFailures.set(status.consecutiveFailures);
       emitCircuitBreakerWarning();
     }
 
@@ -382,6 +403,7 @@ export function createPoller(deps: PollerDeps) {
       // Belt and braces: `cycle` already swallows per-target failures, so this
       // only fires on a bug. Either way the loop survives it.
       status.consecutiveFailures += 1;
+      metrics?.consecutiveFailures.set(status.consecutiveFailures);
       emitCircuitBreakerWarning();
       status.lastError = { at: Date.now(), message: errMessage(err) };
       console.error(`[poller] cycle threw: ${errMessage(err)}`);

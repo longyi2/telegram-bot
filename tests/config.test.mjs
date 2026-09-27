@@ -292,3 +292,123 @@ test("ConfigError: message lists all problems and includes copy hint", () => {
   assert.equal(err.name, "ConfigError");
   assert.deepEqual(err.problems, ["problem one", "problem two"]);
 });
+
+// ── METRICS_PORT ──────────────────────────────────────────────────────────────
+
+test("loadConfig: METRICS_PORT absent defaults to null (server disabled)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: undefined }), () => {
+    const config = loadConfig();
+    assert.equal(config.metricsPort, null);
+  });
+});
+
+test("loadConfig: METRICS_PORT empty string defaults to null (server disabled)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "" }), () => {
+    const config = loadConfig();
+    assert.equal(config.metricsPort, null);
+  });
+});
+
+test("loadConfig: METRICS_PORT=9090 is accepted and parsed as a number", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "9090" }), () => {
+    const config = loadConfig();
+    assert.equal(config.metricsPort, 9090);
+  });
+});
+
+test("loadConfig: METRICS_PORT=1 is accepted (minimum valid port)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "1" }), () => {
+    const config = loadConfig();
+    assert.equal(config.metricsPort, 1);
+  });
+});
+
+test("loadConfig: METRICS_PORT=65535 is accepted (maximum valid port)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "65535" }), () => {
+    const config = loadConfig();
+    assert.equal(config.metricsPort, 65535);
+  });
+});
+
+test("loadConfig: METRICS_PORT=0 is rejected (below minimum)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "0" }), () => {
+    assert.throws(() => loadConfig(), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.problems.some((p) => p.includes("METRICS_PORT")),
+        `Expected METRICS_PORT problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      return true;
+    });
+  });
+});
+
+test("loadConfig: METRICS_PORT=65536 is rejected (above maximum)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "65536" }), () => {
+    assert.throws(() => loadConfig(), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.problems.some((p) => p.includes("METRICS_PORT")),
+        `Expected METRICS_PORT problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      return true;
+    });
+  });
+});
+
+test("loadConfig: METRICS_PORT=-1 is rejected (negative)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "-1" }), () => {
+    assert.throws(() => loadConfig(), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.problems.some((p) => p.includes("METRICS_PORT")),
+        `Expected METRICS_PORT problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      return true;
+    });
+  });
+});
+
+test("loadConfig: METRICS_PORT=9090.5 is rejected (non-integer)", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "9090.5" }), () => {
+    assert.throws(() => loadConfig(), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.problems.some((p) => p.includes("METRICS_PORT")),
+        `Expected METRICS_PORT problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      return true;
+    });
+  });
+});
+
+test("loadConfig: METRICS_PORT=notanumber is rejected", () => {
+  withEnv(validBotEnv({ METRICS_PORT: "notanumber" }), () => {
+    assert.throws(() => loadConfig(), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.problems.some((p) => p.includes("METRICS_PORT")),
+        `Expected METRICS_PORT problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      return true;
+    });
+  });
+});
+
+test("loadConfig: METRICS_PORT problem is collected alongside other problems", () => {
+  // METRICS_PORT=0 is invalid AND BOT_TOKEN is missing — both should appear.
+  withEnv(validBotEnv({ BOT_TOKEN: undefined, METRICS_PORT: "0" }), () => {
+    assert.throws(() => loadConfig(), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.problems.some((p) => p.includes("BOT_TOKEN")),
+        `Expected BOT_TOKEN problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      assert.ok(
+        err.problems.some((p) => p.includes("METRICS_PORT")),
+        `Expected METRICS_PORT problem; got: ${JSON.stringify(err.problems)}`,
+      );
+      return true;
+    });
+  });
+});
