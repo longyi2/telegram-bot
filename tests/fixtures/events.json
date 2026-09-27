@@ -1,0 +1,263 @@
+{
+  "config": {
+    "chatId": "-1001234567890",
+    "marketContractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "squadContractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "rpcUrl": "https://example.invalid/rpc",
+    "horizonUrl": "https://example.invalid/horizon",
+    "networkPassphrase": "Test SDF Network ; September 2015"
+  },
+  "cases": [
+    {
+      "id": "claim_challenged_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "challenged",
+        "2\\.0000000 USDC",
+        "Challenger"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226692,
+        "txHash": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        "at": 1724000000,
+        "eventId": "4226692-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 7,
+          "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "stake": "20000000"
+        }
+      }
+    },
+    {
+      "id": "claim_created_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "New claim",
+        "crypto",
+        "Creator"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226691,
+        "txHash": "",
+        "at": 1724000001,
+        "eventId": "4226691-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 7,
+          "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "category": "crypto"
+        }
+      }
+    },
+    {
+      "id": "claim_resolved_with_summary",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "resolved",
+        "challengers",
+        "Confidence"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226728,
+        "txHash": "",
+        "at": 1724000002,
+        "eventId": "4226728-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 7,
+          "winnerSide": 2,
+          "summary": "Onchain smoke \u2014 challengers awarded",
+          "confidence": 100,
+          "evidenceHash": "deadbeef"
+        }
+      }
+    },
+    {
+      "id": "unknown_malformed_amount",
+      "kind": "negative",
+      "expect": "skip",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 44,
+        "txHash": "",
+        "at": 0,
+        "eventId": "44-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "claim_challenged",
+          "reason": "malformed amount"
+        }
+      }
+    },
+    {
+      "id": "admin_shaped_unknown",
+      "kind": "negative",
+      "expect": "skip",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 50,
+        "txHash": "",
+        "at": 0,
+        "eventId": "50-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "oracle_changed",
+          "reason": "admin event"
+        }
+      }
+    },
+    {
+      "id": "negative_stake_amount_unknown",
+      "kind": "negative",
+      "expect": "skip",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 51,
+        "txHash": "",
+        "at": 0,
+        "eventId": "51-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "claim_challenged",
+          "reason": "claim_challenged.stake: expected non-negative amount, got -20000000"
+        }
+      }
+    },
+    {
+      "id": "category_markdown_reserved",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "New claim",
+        "\\*",
+        "\\_"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 42,
+        "txHash": "",
+        "at": 0,
+        "eventId": "42-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 9,
+          "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "category": "a*_b"
+        }
+      }
+    },
+    {
+      "id": "zero_stake_challenged",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "0\\.0000000 USDC"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 60,
+        "txHash": "",
+        "at": 0,
+        "eventId": "60-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 1,
+          "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "stake": "0"
+        }
+      }
+    },
+    {
+      "id": "long_summary_clipped",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "resolved",
+        "\u2026"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 70,
+        "txHash": "",
+        "at": 0,
+        "eventId": "70-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 3,
+          "winnerSide": 1,
+          "summary": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+          "confidence": 50,
+          "evidenceHash": "00"
+        }
+      }
+    },
+    {
+      "id": "squad_market_created",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "squad market",
+        "Will X happen",
+        "Captain"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 80,
+        "txHash": "",
+        "at": 1724000100,
+        "eventId": "80-0",
+        "payload": {
+          "name": "market_created",
+          "marketId": 2,
+          "captain": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "deadline": 1725000000,
+          "feeBps": 100,
+          "question": "Will X happen?"
+        }
+      }
+    },
+    {
+      "id": "squad_deposit",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Squad",
+        "Side A",
+        "1\\.0000000 USDC"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 81,
+        "txHash": "",
+        "at": 1724000101,
+        "eventId": "81-0",
+        "payload": {
+          "name": "deposited",
+          "marketId": 2,
+          "side": 1,
+          "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "10000000",
+          "shares": "10000000"
+        }
+      }
+    }
+  ]
+}
