@@ -10,6 +10,7 @@ import { Bot } from "grammy";
 import { escapeMd } from "./notifications/format.js";
 import { networkLabel, type BotConfig } from "./config.js";
 import type { PollerStatus } from "./poller.js";
+import { log } from "./log.js";
 
 const HELP = [
   "*Mimir notifier*",
@@ -89,7 +90,7 @@ export function createBot(deps: BotDeps): Bot {
   // grammy rethrows handler errors by default, which would take the process
   // with it. A malformed command must not be fatal.
   bot.catch((err) => {
-    console.error(`[bot] handler error on update ${err.ctx.update.update_id}:`, err.error);
+    log.error(`[bot] handler error on update ${err.ctx.update.update_id}:`, err.error);
   });
 
   return bot;
@@ -115,6 +116,6 @@ export async function registerCommands(bot: Bot): Promise<void> {
     ]);
   } catch (err) {
     // Cosmetic. Never worth failing a boot over.
-    console.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
+    log.warn(`[bot] setMyCommands failed: ${err instanceof Error ? err.message : err}`);
   }
 }
