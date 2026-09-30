@@ -10,6 +10,7 @@ Operational guidance for recovering the Mimir Telegram notifier from missed noti
 * Cursors must only move according to the poller's existing persistence rules.
 * A shutdown flush may only persist cursors the poller already advanced; it never invents a resume position.
 * Logs and status output must not expose bot tokens, private keys, payment proofs, or unbounded remote payloads.
+  Scrubbing is centralized in `src/redact.ts` (regression suite: `tests/redaction.test.mjs`).
 
 Notification text from contract String fields is bounded to 200 Unicode code
 points before MarkdownV2 escaping. An oversized or malformed transaction hash
@@ -134,6 +135,12 @@ does not hold the cursor back because replaying every missed notification could
 create an unbounded backlog or flood a recovered chat. The log reports the
 sent/failed/skipped counts for that commit.
 
+Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
+`10000`). A send that exceeds this deadline is aborted and counted as a failure
+for that event; the poller continues with the remaining events in the page and
+commits the cursor under the normal rules. The timeout applies per send, not to
+the whole cycle, so a single slow request cannot stall the poller indefinitely.
+
 The Stellar chain remains the authoritative record.
 
 ## Stale or corrupt cursor
@@ -145,6 +152,10 @@ The Stellar chain remains the authoritative record.
 * The process reports a cursor-loading problem.
 * `/status` reports `Cursors rewound to the retained floor: N`, or `status.json`
   / `GET /health` show a non-null `rewindFromLedger`, after a long outage.
+* `GET /health` returns `503` and a target has `cursorStale: true`, even if the
+  other watched contract is scanning successfully.
+* `/status` shows send errors clustered around a single slow event, with the
+  remaining events in the same page still delivered.
 
 ### Recovery
 
@@ -153,6 +164,10 @@ preserve the quarantined copy for investigation.
 
 A syntactically valid cursor that Soroban rejects as stale is first checked
 against a fresh `getHealth()`:
+
+Timing out an individual send does not change cursor behavior: the cursor still
+advances only after the returned page is processed, and a timed-out send is
+treated exactly like any other failed send.
 
 * If the cursor's ledger is **strictly below** `oldestLedger`, the position it
   points at is already unrecoverable, so the poller drops it and rescans from
@@ -189,6 +204,42 @@ If the stored cursor is confirmed incompatible or permanently outside RPC retent
 On a cold start, the poller begins from its configured lookback rather than replaying the entire retained RPC history.
 
 Never replace a cursor with an arbitrary ledger or cursor value unless the repository's cursor format and retained-history requirements have been verified. `/pause` and `/resume` are safe alternatives because they leave the version-1 cursor file untouched.
+
+### Back up or restore a cursor
+
+Use the offline cursor CLI to preserve a valid reader position before a deploy
+or deliberate recovery. A backup can run while polling: cursor writes are
+atomic, so it captures either the prior or the newly committed complete file.
+Keep the backup on persistent storage and preferably outside the directory
+being replaced.
+
+```bash
+npm run cursor -- backup --out /safe-storage/cursor-before-recovery.json
+```
+
+Restore only after stopping the notifier. The command takes
+`INSTANCE_LOCK_FILE` (default `data/poller.lock`) for the duration of the
+atomic replacement, so it fails if a live bot owns the cursor. Existing cursor
+state is never replaced without `--force`:
+
+```bash
+npm run cursor -- restore --from /safe-storage/cursor-before-recovery.json --force
+```
+
+The backup must be valid version 1 or a supported legacy cursor file. Malformed
+or future-version backups are rejected without changing the live file. Legacy
+files are normalized to version 1 on restore, including their known dedup
+state. If restore reports a lock error, stop the owning process; only remove a
+leftover lock manually after verifying that no notifier is running. After
+restart, confirm `/status` shows the restored cursor and polling advances.
+
+Restoring reader state does not recover Telegram sends already dropped under
+normal lossy-delivery rules. It can replay events after the restored cursor or
+skip newer events if the backup is old; Stellar remains the source of truth.
+On Railway, run the command with the same persistent `/app/data` volume as the
+service, or mount the backup location separately. Keep the original cursor and
+backup until the restarted release is healthy so another restore or release
+rollback remains possible.
 
 ## Process restart
 
@@ -258,6 +309,11 @@ If Telegram rate limits are observed:
 2. Check `/status` for send errors.
 3. Do not disable the notification cap to compensate.
 4. Allow subsequent polling cycles to continue normally.
+
+If sends are timing out rather than being rate limited, confirm
+`TELEGRAM_SEND_TIMEOUT_MS` is set to a value appropriate for the deployment's
+network path before raising it; the default is chosen to keep a single slow
+send from delaying the rest of the cycle.
 
 Do not manually replay large event ranges into Telegram.
 

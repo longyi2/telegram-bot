@@ -146,7 +146,7 @@ function botConfig(cursorFile, mock, overrides = {}) {
   return {
     ...stellarConfig(mock),
     botToken: TOKEN,
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 25,
     startLookbackLedgers: 60,

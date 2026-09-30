@@ -25,6 +25,7 @@
 
 import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
+import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
 
 /** Which of the two Mimir contracts an event came from. */
@@ -307,6 +308,71 @@ function diagnostic(value: unknown): string {
 
 class DecodeError extends Error {}
 
+/**
+ * Ceiling on a single event's decoded footprint.
+ *
+ * Soroban events can carry arbitrary `String` / `Bytes` values — claim
+ * categories, summaries, questions. Unbounded, a hostile or buggy contract can
+ * make the notifier allocate, and then JSON-log, multi-megabyte payloads every
+ * poll cycle. The cap is measured on the XDR wire form *before*
+ * `scValToNative`, so an oversized value never inflates into a JS string in the
+ * first place.
+ *
+ * 16 KiB is far above any legitimate Mimir event on Testnet, and far below
+ * anything that would distress the poller.
+ */
+export const MAX_DECODED_EVENT_XDR_BYTES = 16_384;
+
+/** Per-topic XDR budget — event names, ids and addresses are all tiny. */
+export const MAX_EVENT_TOPIC_XDR_BYTES = 1_024;
+
+/** Hard ceiling on any single decoded string field after native conversion. */
+export const MAX_DECODED_STRING_CHARS = 2_048;
+
+/**
+ * Wire size of one `ScVal`.
+ *
+ * Anything that is not a `ScVal` measures as zero: the RPC response is typed but
+ * not trusted, and a non-`ScVal` is `native()`'s problem to diagnose, not this
+ * function's. Its message is more specific than "over the cap".
+ */
+function scValXdrBytes(value: unknown): number {
+  if (!value || typeof (value as { toXDR?: unknown }).toXDR !== "function") return 0;
+  try {
+    const bytes = (value as xdr.ScVal).toXDR();
+    return bytes.byteLength ?? (bytes as Buffer).length;
+  } catch {
+    // Fail closed: a value we cannot serialize is over the cap by definition.
+    return MAX_DECODED_EVENT_XDR_BYTES + 1;
+  }
+}
+
+/** Reject an event whose wire form is too large to decode safely. */
+function assertEventXdrWithinCap(event: rpc.Api.EventResponse): void {
+  const valueBytes = scValXdrBytes(event.value);
+  if (valueBytes > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.value XDR ${valueBytes} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+
+  const topics = Array.isArray(event.topic) ? event.topic : [];
+  let topicTotal = 0;
+  for (let i = 0; i < topics.length; i += 1) {
+    const bytes = scValXdrBytes(topics[i]);
+    if (bytes > MAX_EVENT_TOPIC_XDR_BYTES) {
+      throw new DecodeError(
+        `event.topic[${i}] XDR ${bytes} bytes exceeds per-topic cap of ${MAX_EVENT_TOPIC_XDR_BYTES}`,
+      );
+    }
+    topicTotal += bytes;
+  }
+  if (topicTotal > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.topic XDR total ${topicTotal} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+}
 function native(value: xdr.ScVal): unknown {
   return scValToNative(value);
 }
@@ -344,11 +410,22 @@ function num(value: unknown, what: string): number {
 }
 
 function str(value: unknown, what: string): string {
-  if (typeof value === "string") return value;
-  // A contract `String` normally decodes to a JS string, but bytes-shaped
-  // payloads show up as Buffer on some SDK paths.
-  if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
-  throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  let s: string;
+  if (typeof value === "string") {
+    s = value;
+  } else if (value instanceof Uint8Array) {
+    // A contract `String` normally decodes to a JS string, but bytes-shaped
+    // payloads show up as Buffer on some SDK paths.
+    s = Buffer.from(value).toString("utf8");
+  } else {
+    throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  }
+  if (s.length > MAX_DECODED_STRING_CHARS) {
+    throw new DecodeError(
+      `${what}: string length ${s.length} exceeds cap of ${MAX_DECODED_STRING_CHARS}`,
+    );
+  }
+  return s;
 }
 
 /** An `Address` decodes to its `G…`/`C…` strkey. */
@@ -822,6 +899,11 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
     const first = topics[0];
     eventName = typeof first === "string" ? first : "";
 
+    // Fail closed before native conversion allocates: an oversized value must
+    // not turn one hostile event into a multi-megabyte payload. This runs after
+    // the name is read so the `unknown` payload still says which event it was.
+    assertEventXdrWithinCap(event);
+
     let decodedValue: unknown = undefined;
     if (event.value !== undefined && event.value !== null) {
       try {
@@ -990,28 +1072,59 @@ export function sortEvents<T extends EventMeta>(events: readonly T[]): T[] {
 }
 
 /**
- * Drop within-scan duplicates by paging token (`eventId`). The RPC may repeat
- * the boundary event across pages; the first occurrence wins and input order
- * is preserved. Events with no paging token cannot be identified and are all
- * kept — identity is never invented.
+ * Drop within-scan duplicates using the canonical {@link eventKey} derivation
+ * shared with the raw-layer window and the replay CLI, so one event cannot be
+ * identified one way here and another way there. The RPC may repeat the
+ * boundary event across pages; the first occurrence wins and input order is
+ * preserved. Decoded events carry no `topic`, so the composite branch is
+ * unreachable here — an event without a paging token yields `null`, is kept,
+ * and identity is never invented.
  */
 export function dedupeEvents<T extends EventMeta>(events: readonly T[]): T[] {
   const seen = new Set<string>();
   const out: T[] = [];
   for (const event of events) {
-    const id = event.eventId;
-    if (!id) {
+    const key = eventKey(event);
+    if (key === null) {
       out.push(event);
       continue;
     }
-    if (seen.has(id)) continue;
-    seen.add(id);
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(event);
   }
   return out;
 }
 
 // ── Display helpers (shared by formatting and the CLI) ───────────────────────
+
+/** One field's budget in a log line, and the whole document's. */
+const MAX_LOG_FIELD_CHARS = 240;
+const MAX_LOG_JSON_CHARS = 4_096;
+
+/**
+ * JSON-safe view of a payload for logs and the `scan` CLI.
+ *
+ * Bounded twice, because the failure modes differ: every string is collapsed to
+ * a single line and capped, so one remote value cannot dominate a log line, and
+ * the serialized document is capped as a whole, so a payload built from many
+ * fields cannot either. `bigint` is stringified explicitly because
+ * `JSON.stringify` throws on it.
+ */
+export function summarizePayloadForLog(
+  payload: unknown,
+  maxChars = MAX_LOG_JSON_CHARS,
+): string {
+  const json = JSON.stringify(payload, (_key, item) => {
+    if (typeof item === "bigint") return item.toString();
+    if (typeof item !== "string") return item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= MAX_LOG_FIELD_CHARS
+      ? compact
+      : `${compact.slice(0, MAX_LOG_FIELD_CHARS - 1)}…`;
+  });
+  return json.length <= maxChars ? json : `${json.slice(0, maxChars - 1)}…`;
+}
 
 /**
  * Atomic USDC -> an explicit 7-decimal string.

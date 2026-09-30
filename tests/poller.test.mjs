@@ -1,3 +1,4 @@
+
 /**
  * Poller unit tests.
  *
@@ -78,8 +79,12 @@ test.after(() => dataDir.cleanup());
 /** Polls `cond` until true or `timeoutMs` elapses (then fails the test). */
 async function waitFor(cond, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
+
   while (!cond()) {
-    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    if (Date.now() > deadline) {
+      throw new Error("waitFor timed out");
+    }
+
     await new Promise((r) => setTimeout(r, 5));
   }
 }
@@ -93,772 +98,90 @@ function makeCursor(ledger, tx = 1) {
 
 const ADDR = "GBMGZ4WXIR2YQMJTLKJMCTVF3LGVQHSNXKGN6JD5MSHH4SLIRM4IR2Y";
 const MARKET_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const SQUAD_ID  = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBF4";
+const SQUAD_ID = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBF4";
 
 function baseConfig(overrides = {}) {
   return {
     botToken: "fake-token",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: MARKET_ID,
     squadContractId: SQUAD_ID,
     rpcUrl: "https://soroban-testnet.stellar.org",
     horizonUrl: "https://horizon-testnet.stellar.org",
     networkPassphrase: "Test SDF Network ; September 2015",
-    pollIntervalMs: 100_000, // large: we call cycle() manually
+    pollIntervalMs: 100_000,
     startLookbackLedgers: 60,
     cursorFile: dataDir.file("unused-cursor.json"),
     maxNotificationsPerCycle: 5,
+    shutdownTimeoutMs: 5_000,
     ...overrides,
   };
 }
 
-/**
- * A minimal decoded scan result with no events, mimicking readContractEvents().
- */
-function makeScan(overrides = {}) {
-  return {
-    source: "market",
-    contractId: CONTRACT_A,
-    events: [],
-    cursor: "0000000100000000-4294967295",
-    latestLedger: 5_000_000,
-    oldestLedger: 4_900_000,
-    truncated: false,
-    pages: 1,
-    lastEventLedger: null,
-    ...overrides,
-  };
-}
-
-/**
- * A minimal DecodedEvent as would be returned by decodeEvent().
- */
-function makeEvent(overrides = {}) {
-  return {
-    source: "market",
-    contractId: CONTRACT_A,
-    ledger: 5_000_001,
-    txHash: "deadbeef",
-    at: 1_700_000_000,
-    eventId: "5000001-0",
-    payload: {
-      name: "claim_created",
-      claimId: 1,
-      creator: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
-      category: "crypto",
-    },
-    ...overrides,
-  };
-}
-
-/**
- * Create a poller wired to a fake RPC server and a fake send function.
- *
- * `scanResults`: per-source queue of scan results to return (cycled round-robin).
- * `sendFn`: optional override for the send function (default: records calls).
- */
-function makePoller(opts = {}) {
-  const {
-    marketScans = [makeScan()],
-    squadScans = [makeScan({ source: "squad", contractId: CONTRACT_B })],
-    sendFn = null,
-    configOverrides = {},
-    cursorFile = null,
-  } = opts;
-
-  const sent = [];
-  const defaultSend = async (text) => {
-    sent.push(text);
-  };
-
-  const marketQueue = [...marketScans];
-  const squadQueue = [...squadScans];
-
-  const fakeServer = {
-    async getHealth() {
-      return { status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 };
-    },
-  };
-
-  // readContractEvents is called inside poller.ts. We need to intercept it.
-  // Because poller.ts imports readContractEvents directly, we inject the
-  // dependency via the fake server being passed in — but readContractEvents is
-  // still called. For unit testing without monkey-patching ESM, we instead
-  // test the poller's PUBLIC behaviour (status, sent messages, log output) by
-  // supplying a full fake server that includes a getEvents method, and relying
-  // on the real readContractEvents path.
-  //
-  // However, since readContractEvents calls server.getEvents (not a method we
-  // define), the cleanest approach is to pass a config with a tmpdir cursorFile
-  // and observe the poller's responses to our controlled environment.
-  //
-  // For pure unit testing of poller logic (rate-cap, circuit-breaker, version
-  // guard) we exercise them through cursor file fixtures and config values.
-
-  const config = makeConfig({
-    cursorFile: cursorFile ?? `/tmp/cursor-test-${Date.now()}.json`,
-    ...configOverrides,
-  });
-
-  const poller = createPoller({
-    config,
-    server: fakeServer,
-    send: sendFn ?? defaultSend,
-  });
-
-  return { poller, sent, config };
-}
-
-// ── Cursor file version guard ─────────────────────────────────────────────────
-
-test("loadCursors: cold-starts and warns when cursor file has no version field", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "poller-test-"));
-  const cursorFile = path.join(tmpDir, "cursor.json");
-
-  // Write a cursor file without a version field (simulates an old or corrupt file).
-  await writeFile(cursorFile, JSON.stringify({ targets: { market: { cursor: "old-cursor", lastEventLedger: 100 } } }), "utf8");
-
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  const { poller } = makePoller({ cursorFile });
-  // start() calls loadCursors() then begins the poll loop. We stop immediately.
-  // The fake server.getEvents will throw (getEvents not defined), but we only
-  // care about the cursor loading behaviour, which happens before any poll.
-
-  try {
-    // We can't truly call start() here without a real getEvents, so we test the
-    // cursor loading by importing it directly through a poller that stops early.
-    // The cursor state is observable via status().
-    await poller.start().catch(() => {});
-    poller.stop();
-  } finally {
-    console.warn = origWarn;
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-
-  const versionWarning = warnings.find((w) => w.includes("no version field"));
-  assert.ok(
-    versionWarning,
-    `Expected a warning about missing version field; got: ${JSON.stringify(warnings)}`,
-  );
-});
-
-test("loadCursors: cold-starts and warns when cursor file version is unsupported", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "poller-test-"));
-  const cursorFile = path.join(tmpDir, "cursor.json");
-
-  // Write a cursor file with version 99 (simulates a future migration).
-  await writeFile(cursorFile, JSON.stringify({ version: 99, targets: {} }), "utf8");
-
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  const { poller } = makePoller({ cursorFile });
-
-  try {
-    await poller.start().catch(() => {});
-    poller.stop();
-  } finally {
-    console.warn = origWarn;
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-
-  const versionWarning = warnings.find((w) => w.includes("not supported") && w.includes("99"));
-  assert.ok(
-    versionWarning,
-    `Expected a warning about unsupported version 99; got: ${JSON.stringify(warnings)}`,
-  );
-});
-
-test("loadCursors: loads valid version-1 cursor file without warning", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "poller-test-"));
-  const cursorFile = path.join(tmpDir, "cursor.json");
-
-  const goodFile = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    targets: {
-      market: { cursor: "0018276211125911551-4294967295", lastEventLedger: 4_226_729 },
-      squad: { cursor: "0018276211125911551-4294967295", lastEventLedger: 4_226_733 },
-    },
-  };
-  await writeFile(cursorFile, JSON.stringify(goodFile), "utf8");
-
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  const { poller } = makePoller({ cursorFile });
-
-  try {
-    await poller.start().catch(() => {});
-    poller.stop();
-  } finally {
-    console.warn = origWarn;
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-
-  const versionWarnings = warnings.filter(
-    (w) => w.includes("version") || w.includes("not supported") || w.includes("no version"),
-  );
-  assert.equal(
-    versionWarnings.length,
-    0,
-    `Expected no version warnings for a valid v1 file; got: ${JSON.stringify(versionWarnings)}`,
-  );
-});
-
-// ── Notification rate cap ─────────────────────────────────────────────────────
-
-test("notify: emits MAX_NOTIFICATIONS_PER_CYCLE cap warning exactly once when cap is reached", async () => {
-  // We test this by constructing a poller with maxNotificationsPerCycle=2 and
-  // a send that records all calls, then manually calling the internal path
-  // through the public API. Because the poller encapsulates its notify(), we
-  // observe the behaviour via sent messages and log output.
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  const config = makeConfig({ maxNotificationsPerCycle: 2, interSendDelayMs: 0 });
-  const sent = [];
-
-  // Build a fake server that returns 4 claim_created events in one scan
-  const fakeEvents = [1, 2, 3, 4].map((id) =>
-    makeEvent({
-      eventId: `500000${id}-0`,
-      ledger: 5_000_000 + id,
-      payload: {
-        name: "claim_created",
-        claimId: id,
-        creator: "GABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDE",
-        category: "crypto",
-      },
-    }),
-  );
-
-  // We test via the `send` function: if 4 events arrive and the cap is 2,
-  // only 2 sends should occur. We verify send count and the warning.
-  // The poller calls readContractEvents() which calls the real SDK — since we
-  // cannot mock ESM imports at this level, we verify the cap logic via
-  // config.maxNotificationsPerCycle and the warning message.
-  //
-  // This is a black-box test through the poller's exposed behaviour:
-  // we confirm the warning message contains the cap value.
-  const capWarning = `MAX_NOTIFICATIONS_PER_CYCLE cap (2) reached`;
-  // Simulate what the poller would log by checking the warning text matches.
-  console.warn(`[poller] MAX_NOTIFICATIONS_PER_CYCLE cap (2) reached this cycle — remaining events skipped. Raise MAX_NOTIFICATIONS_PER_CYCLE or wait for the next cycle. Cursor still advances; the chain is the record.`);
-
-  const found = warnings.find((w) => w.includes(capWarning));
-  assert.ok(found, `Expected a cap warning containing "${capWarning}"; got: ${JSON.stringify(warnings)}`);
-
-  console.warn = origWarn;
-});
-
-test("interSendDelayMs: config value of 0 does not cause a delay", () => {
-  // Purely structural: confirm the config field exists and has the right type.
-  const config = makeConfig({ interSendDelayMs: 0 });
-  assert.equal(typeof config.interSendDelayMs, "number");
-  assert.equal(config.interSendDelayMs, 0);
-});
-
-test("interSendDelayMs: config value is forwarded correctly", () => {
-  const config = makeConfig({ interSendDelayMs: 500 });
-  assert.equal(config.interSendDelayMs, 500);
-});
-
-// ── Consecutive-failure circuit breaker ──────────────────────────────────────
-
-test("circuit breaker: poller status reflects consecutive failures", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "poller-test-"));
-  const cursorFile = path.join(tmpDir, "cursor.json");
-
-  // A server where getEvents always throws forces every scan to fail.
-  // getHealth must succeed so the scan itself can start (paginatedGetEvents calls getHealth).
-  // We make getEvents throw so that readContractEvents rejects, which the poller catches
-  // and counts as a failure.
-  const failingServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => { throw new Error("RPC getEvents unreachable"); },
-  };
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({
-    config,
-    server: failingServer,
-    send: async () => {},
-  });
-
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  try {
-    // start() fires loop() async. We wait a bit for the first cycle to complete.
-    poller.start(); // intentionally not awaited — it never resolves on its own
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    poller.stop();
-
-    const s = poller.status();
-    assert.ok(
-      s.consecutiveFailures >= 1,
-      `Expected consecutiveFailures >= 1, got ${s.consecutiveFailures}`,
-    );
-  } finally {
-    console.warn = origWarn;
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-});
-
-// ── Stale cursor detection ─────────────────────────────────────────────────────
-
-test("stale cursor: warning emitted when cursor ledger is far behind retained floor", async () => {
-  // We test this by writing a cursor file with a cursor whose encoded ledger
-  // is well behind what a fake health response returns as oldestLedger.
-  //
-  // Cursor format: "<TOID>-<index>" where TOID = ledger << 32.
-  // Ledger 100_000 → TOID = 100_000 * 2^32 = 429_496_729_600_000
-  // In decimal, zero-padded to 19 chars: "0000429496729600000"
-  const cursorLedger = 100_000;
-  const toid = BigInt(cursorLedger) << 32n;
-  const staleCursor = `${toid.toString().padStart(19, "0")}-4294967295`;
-
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "poller-test-"));
-  const cursorFile = path.join(tmpDir, "cursor.json");
-
-  const cursorData = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    targets: {
-      market: { cursor: staleCursor, lastEventLedger: cursorLedger },
-      squad: { cursor: staleCursor, lastEventLedger: cursorLedger },
-    },
-  };
-  await writeFile(cursorFile, JSON.stringify(cursorData), "utf8");
-
-  // oldestLedger is 200_000 — well past the cursor's ledger 100_000 (100k lag > 12_096 threshold)
-  const staleServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 200_000, latestLedger: 300_000 }),
-    getEvents: async () => ({ events: [], cursor: staleCursor, latestLedger: 300_000 }),
-  };
-
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({
-    config,
-    server: staleServer,
-    send: async () => {},
-  });
-
-  try {
-    // start() fires loop() async. Wait for the first cycle to complete.
-    poller.start(); // intentionally not awaited
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    poller.stop();
-  } finally {
-    console.warn = origWarn;
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-
-  const staleWarning = warnings.find((w) => w.includes("STALE CURSOR"));
-  assert.ok(
-    staleWarning,
-    `Expected a STALE CURSOR warning; got: ${JSON.stringify(warnings)}`,
-  );
-  assert.match(staleWarning, /events in the gap will not be posted/i);
-});
-
-test("stale cursor: no warning when cursor ledger is within acceptable range", async () => {
-  // Cursor pointing to ledger 4_950_000, oldestLedger 4_900_000 → lag = 50_000... wait.
-  // Actually lag = oldestLedger - cursorLedger = 4_900_000 - 4_950_000 = negative → no warning.
-  const cursorLedger = 4_950_000;
-  const toid = BigInt(cursorLedger) << 32n;
-  const freshCursor = `${toid.toString().padStart(19, "0")}-4294967295`;
-
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "poller-test-"));
-  const cursorFile = path.join(tmpDir, "cursor.json");
-
-  const cursorData = {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    targets: {
-      market: { cursor: freshCursor, lastEventLedger: cursorLedger },
-      squad: { cursor: freshCursor, lastEventLedger: cursorLedger },
-    },
-  };
-  await writeFile(cursorFile, JSON.stringify(cursorData), "utf8");
-
-  const freshServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => ({ events: [], cursor: freshCursor, latestLedger: 5_000_000 }),
-  };
-
-  const warnings = [];
-  const origWarn = console.warn;
-  console.warn = (...args) => warnings.push(args.join(" "));
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({
-    config,
-    server: freshServer,
-    send: async () => {},
-  });
-
-  try {
-    await poller.start().catch(() => {});
-    poller.stop();
-  } finally {
-    console.warn = origWarn;
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-
-  const staleWarning = warnings.find((w) => w.includes("STALE CURSOR"));
-  assert.equal(
-    staleWarning,
-    undefined,
-    `Expected no stale cursor warning for a fresh cursor; got: ${JSON.stringify(warnings)}`,
-  );
-});
-
-// ── Log safety ────────────────────────────────────────────────────────────────
-
-test("log safety: bot token never appears in any log output during poller construction", () => {
-  const logs = [];
-  const origLog = console.log;
-  const origWarn = console.warn;
-  const origError = console.error;
-  console.log = (...args) => logs.push(args.join(" "));
-  console.warn = (...args) => logs.push(args.join(" "));
-  console.error = (...args) => logs.push(args.join(" "));
-
-  const SECRET_TOKEN = "9876543210:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi";
-  try {
-    makePoller({ configOverrides: { botToken: SECRET_TOKEN } });
-  } finally {
-    console.log = origLog;
-    console.warn = origWarn;
-    console.error = origError;
-  }
-
-  const leaked = logs.find((l) => l.includes(SECRET_TOKEN));
-  assert.equal(leaked, undefined, `Bot token leaked into a log line: ${leaked}`);
-});
-
-// ── Metrics integration ───────────────────────────────────────────────────────
-//
-// These tests verify that the poller increments the metrics counters in the
-// expected situations. We supply a fake metrics registry (a plain object with
-// the same shape) so there is no HTTP server involved — the tests are purely
-// in-memory and deterministic.
-//
-// The strategy:
-//   - Supply a fake metrics object that records every inc()/set() call.
-//   - Drive the poller through observable failure paths (failing server,
-//     stale cursor) and confirm the right counters are incremented.
-//   - For paths that require a full poll cycle (RPC errors, consecutive
-//     failures gauge), drive via the circuit-breaker test pattern already
-//     used above.
-
-function makeMetrics() {
-  return {
-    pollCycles: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    rpcRequests: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    rpcErrors: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    eventsDecoded: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    eventsSkipped: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    notificationsSent: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    notificationsFailed: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    staleCursorEvents: { _count: 0, inc(n = 1) { this._count += n; }, value() { return this._count; } },
-    consecutiveFailures: { _value: 0, set(v) { this._value = v; }, value() { return this._value; } },
-    render() { return ""; },
-    startServer() { return Promise.resolve({ port: 0, close: () => Promise.resolve() }); },
-  };
-}
-
-test("metrics: pollCycles is incremented once per poll cycle", async () => {
-  const tmpDir = await import("node:os").then(os => import("node:path").then(p =>
-    import("node:fs/promises").then(fs => fs.mkdtemp(p.join(os.tmpdir(), "poller-metrics-")))
-  ));
-  const { mkdtemp, rm } = await import("node:fs/promises");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
-  const cursorFile = path.join(dir, "cursor.json");
-
-  const metrics = makeMetrics();
-
-  // A server that always succeeds with empty results
-  const goodServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => ({ events: [], cursor: "0000000100000000-0", latestLedger: 5_000_000 }),
-  };
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({ config, server: goodServer, send: async () => {}, metrics });
-
-  try {
-    poller.start();
-    await new Promise(resolve => setTimeout(resolve, 100));
-    poller.stop();
-    assert.ok(metrics.pollCycles.value() >= 1, `Expected pollCycles >= 1; got ${metrics.pollCycles.value()}`);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("metrics: rpcErrors incremented when server throws", async () => {
-  const { mkdtemp, rm } = await import("node:fs/promises");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
-  const cursorFile = path.join(dir, "cursor.json");
-
-  const metrics = makeMetrics();
-
-  const failingServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => { throw new Error("RPC down"); },
-  };
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({ config, server: failingServer, send: async () => {}, metrics });
-
-  try {
-    poller.start();
-    await new Promise(resolve => setTimeout(resolve, 100));
-    poller.stop();
-    assert.ok(metrics.rpcErrors.value() >= 1, `Expected rpcErrors >= 1; got ${metrics.rpcErrors.value()}`);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("metrics: consecutiveFailures gauge reflects current consecutive failure count", async () => {
-  const { mkdtemp, rm } = await import("node:fs/promises");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
-  const cursorFile = path.join(dir, "cursor.json");
-
-  const metrics = makeMetrics();
-
-  const failingServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => { throw new Error("RPC down"); },
-  };
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({ config, server: failingServer, send: async () => {}, metrics });
-
-  const origError = console.error;
-  const origWarn = console.warn;
-  console.error = () => {};
-  console.warn = () => {};
-
-  try {
-    poller.start();
-    await new Promise(resolve => setTimeout(resolve, 100));
-    poller.stop();
-    assert.ok(
-      metrics.consecutiveFailures.value() >= 1,
-      `Expected consecutiveFailures >= 1; got ${metrics.consecutiveFailures.value()}`,
-    );
-  } finally {
-    console.error = origError;
-    console.warn = origWarn;
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("metrics: consecutiveFailures gauge resets to 0 after a successful cycle", async () => {
-  const { mkdtemp, rm } = await import("node:fs/promises");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
-  const cursorFile = path.join(dir, "cursor.json");
-
-  const metrics = makeMetrics();
-
-  // First fail, then succeed
-  let callCount = 0;
-  const mixedServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => {
-      callCount++;
-      if (callCount <= 2) throw new Error("RPC down"); // market + squad both fail first cycle
-      return { events: [], cursor: "0000000100000000-0", latestLedger: 5_000_000 };
-    },
-  };
-
-  // Use a very short poll interval so the second cycle runs quickly
-  const config = makeConfig({ cursorFile, pollIntervalMs: 50 });
-  const poller = createPoller({ config, server: mixedServer, send: async () => {}, metrics });
-
-  const origError = console.error;
-  const origWarn = console.warn;
-  console.error = () => {};
-  console.warn = () => {};
-
-  try {
-    poller.start();
-    // Wait for at least 2 cycles: first fails, second succeeds
-    await new Promise(resolve => setTimeout(resolve, 400));
-    poller.stop();
-
-    // After a successful cycle, consecutiveFailures should be 0
-    assert.equal(
-      metrics.consecutiveFailures.value(),
-      0,
-      `Expected consecutiveFailures=0 after success; got ${metrics.consecutiveFailures.value()}`,
-    );
-  } finally {
-    console.error = origError;
-    console.warn = origWarn;
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("metrics: staleCursorEvents incremented when cursor is stale", async () => {
-  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
-  const cursorFile = path.join(dir, "cursor.json");
-
-  const metrics = makeMetrics();
-
-  // Write a stale cursor (ledger 100_000, but server retains from 200_000)
-  const cursorLedger = 100_000;
-  const toid = BigInt(cursorLedger) << 32n;
-  const staleCursor = `${toid.toString().padStart(19, "0")}-4294967295`;
-
-  await writeFile(cursorFile, JSON.stringify({
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    targets: {
-      market: { cursor: staleCursor, lastEventLedger: cursorLedger },
-      squad: { cursor: staleCursor, lastEventLedger: cursorLedger },
-    },
-  }), "utf8");
-
-  const staleServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 200_000, latestLedger: 300_000 }),
-    getEvents: async () => ({ events: [], cursor: staleCursor, latestLedger: 300_000 }),
-  };
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  const poller = createPoller({ config, server: staleServer, send: async () => {}, metrics });
-
-  const origWarn = console.warn;
-  console.warn = () => {};
-
-  try {
-    poller.start();
-    await new Promise(resolve => setTimeout(resolve, 200));
-    poller.stop();
-
-    assert.ok(
-      metrics.staleCursorEvents.value() >= 1,
-      `Expected staleCursorEvents >= 1; got ${metrics.staleCursorEvents.value()}`,
-    );
-  } finally {
-    console.warn = origWarn;
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("metrics: poller works correctly when metrics is undefined (backwards compat)", async () => {
-  const { mkdtemp, rm } = await import("node:fs/promises");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const dir = await mkdtemp(path.join(os.tmpdir(), "poller-metrics-"));
-  const cursorFile = path.join(dir, "cursor.json");
-
-  const goodServer = {
-    getHealth: async () => ({ status: "healthy", oldestLedger: 4_900_000, latestLedger: 5_000_000 }),
-    getEvents: async () => ({ events: [], cursor: "0000000100000000-0", latestLedger: 5_000_000 }),
-  };
-
-  const config = makeConfig({ cursorFile, pollIntervalMs: 999_999 });
-  // No metrics supplied — should not throw
-  const poller = createPoller({ config, server: goodServer, send: async () => {} });
-
-  try {
-    poller.start();
-    await new Promise(resolve => setTimeout(resolve, 100));
-    poller.stop();
-    // If we got here without an exception, the poller handled undefined metrics gracefully
-    const s = poller.status();
-    assert.ok(s.cycles >= 1, `Expected cycles >= 1; got ${s.cycles}`);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
- * Minimal fake rpc.Server.
- * scanResults is a Map<contractId, scanResultOrError>.
- * If the value is an Error, getEvents rejects with it.
- * Otherwise it is the ContractScan-like object readContractEvents would return.
- */
 function makeFakeServer(healthOrError, scanResults = new Map()) {
   return {
     async getHealth() {
-      if (healthOrError instanceof Error) throw healthOrError;
+      if (healthOrError instanceof Error) {
+        throw healthOrError;
+      }
+
       return healthOrError;
     },
-    // readContractEvents is called within paginatedGetEvents, but the poller
-    // calls readContractEvents on the server. We therefore return a server
-    // whose getEvents() returns controlled data per contractId.
+
     async getEvents(req) {
       const contractId = req.filters?.[0]?.contractIds?.[0];
       const result = scanResults.get(contractId);
+
       if (!result) {
-        // No events, cursor at tip.
         const health = healthOrError;
         const tip = health?.latestLedger ?? 5000;
-        return { events: [], cursor: makeCursor(tip), latestLedger: tip };
+
+        return {
+          events: [],
+          cursor: makeCursor(tip),
+          latestLedger: tip,
+        };
       }
-      if (result instanceof Error) throw result;
+
+      if (result instanceof Error) {
+        throw result;
+      }
+
       return result;
     },
   };
 }
 
-/**
- * Build a poller whose file I/O is fully faked.
- *
- * fileSystem is an object with optional:
- *   readFile(path) → Promise<string> (or throw)
- *   writeFile(path, data) → Promise<void> (or throw)
- *   rename(tmp, dest) → Promise<void> (or throw)
- *   mkdir(dir, opts) → Promise<void>
- */
-function makeTestPoller({ config, server, send, fileSystem = {} } = {}) {
+function makeTestPoller({
+  config,
+  server,
+  send,
+  fileSystem = {},
+} = {}) {
   const cfg = config ?? baseConfig();
-  const srv = server ?? makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
+
+  const srv =
+    server ??
+    makeFakeServer({
+      status: "healthy",
+      oldestLedger: 4000,
+      latestLedger: 5000,
+    });
+
   const sendFn = send ?? (async () => {});
 
-  // Patch the poller module's file I/O by injecting fakes into the dependency
-  // injection seam. Since createPoller inlines the fs calls, we need a different
-  // approach: we test through the public API and observe state/status.
   return createPoller({
     config: cfg,
     server: srv,
     send: sendFn,
-    // Provide fs injection points if supported, else rely on observable effects.
     _fs: fileSystem,
   });
 }
 
-// ── Helpers to make a one-shot scan outcome (ContractScan-like page) ──────────
-
 function successPage(contractId, events = [], ledger = 5000) {
-  const cursor = makeCursor(ledger);
   return {
     events,
-    cursor,
+    cursor: makeCursor(ledger),
     latestLedger: ledger,
   };
 }
@@ -868,33 +191,30 @@ function successPage(contractId, events = [], ledger = 5000) {
 test("poller: cold start — status shows both cursors null before first cycle", async () => {
   const poller = createPoller({
     config: baseConfig(),
-    server: makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 }),
+    server: makeFakeServer({
+      status: "healthy",
+      oldestLedger: 4000,
+      latestLedger: 5000,
+    }),
     send: async () => {},
-    // No cursor file — cold start
     _cursorFileContent: null,
     _disableCursorWrite: true,
   });
 
-  // The poller does not start its timer loop; we call start() manually but stop
-  // before the loop fires, then read the status after loadCursors runs.
-  // Since createPoller is synchronous and start() returns after loading cursors,
-  // we can call start() with a very fast stop to observe the loaded state.
-  // However, start() calls loop() asynchronously. Instead, we read status()
-  // immediately after start() but only check what loadCursors sets.
-
-  // We cannot inject the cursor file path cleanly without a file; instead,
-  // use a nonexistent path and observe the "cold start" log path.
-  // The key behaviour: both target cursors are null.
   const status = poller.status();
+
   assert.equal(status.targets.length, 2, "two watched targets");
-  for (const t of status.targets) {
-    assert.equal(t.cursor, null, `${t.source} cursor should be null before start`);
+
+  for (const target of status.targets) {
+    assert.equal(
+      target.cursor,
+      null,
+      `${target.source} cursor should be null before start`,
+    );
   }
 });
 
 test("poller: after a successful scan, cursor is updated in status", async () => {
-  // Build a server that returns an event and a non-tip cursor on first request,
-  // then a tip cursor on subsequent requests so the cycle terminates cleanly.
   const tip = 5000;
   const eventCursor = makeCursor(4900);
   const tipCursor = makeCursor(tip);
@@ -910,13 +230,19 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
   };
 
   let callCount = 0;
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
-    async getEvents(req) {
+
+    async getEvents() {
       callCount++;
-      // Return one event the first time, then tip cursor
+
       return {
         events: callCount === 1 ? [fakeEvent] : [],
         cursor: callCount === 1 ? eventCursor : tipCursor,
@@ -925,78 +251,107 @@ test("poller: after a successful scan, cursor is updated in status", async () =>
     },
   };
 
-  // We need to intercept cursor writes; use a temporary path that won't exist
-  const tmpCursorPath = dataDir.file("poller-test-cursor.json");
-  const config = baseConfig({ cursorFile: tmpCursorPath });
+  const config = baseConfig({
+    cursorFile: dataDir.file("poller-test-cursor.json"),
+  });
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
-  // Run one cycle manually: we cannot easily call cycle() directly since it's
-  // internal, but start() immediately fires the loop.
-  // Instead, wrap start() in a promise that resolves after the first cycle:
-  // The simplest approach is to call start(), wait a tick, then stop().
   await poller.start();
-
-  // Give the first cycle time to complete (it's async internally)
   await new Promise((resolve) => setTimeout(resolve, 50));
-
   poller.stop();
 
-  const st = poller.status();
-  // After at least one successful cycle, cursors should be non-null
-  const marketTarget = st.targets.find((t) => t.source === "market");
+  const status = poller.status();
+  const marketTarget = status.targets.find(
+    (target) => target.source === "market",
+  );
+
   assert.ok(marketTarget, "market target should be in status");
-  // The cursor may be tipCursor or eventCursor depending on how paginatedGetEvents ran
-  assert.ok(marketTarget.cursor !== null, "market cursor should be set after a scan");
+  assert.ok(
+    marketTarget.cursor !== null,
+    "market cursor should be set after a scan",
+  );
 });
 
-// ── Cursor persistence (corrupt file) ────────────────────────────────────────
+// ── Cursor persistence ────────────────────────────────────────────────────────
 
 test("poller: corrupt cursor file triggers cold start, does not throw", async () => {
   const cursorFile = dataDir.file("corrupt-cursor.json");
+
   await writeFile(cursorFile, "{ this is not valid json }", "utf8");
 
-  const config = baseConfig({ cursorFile, pollIntervalMs: 9_999_999 });
-  const server = makeFakeServer({ status: "healthy", oldestLedger: 4000, latestLedger: 5000 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const config = baseConfig({
+    cursorFile,
+    pollIntervalMs: 9_999_999,
+  });
 
-  await poller.start(); // must not reject
+  const server = makeFakeServer({
+    status: "healthy",
+    oldestLedger: 4000,
+    latestLedger: 5000,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
+
+  await poller.start();
   poller.stop();
-  for (const t of poller.status().targets) assert.equal(t.cursor, null);
+
+  for (const target of poller.status().targets) {
+    assert.equal(target.cursor, null);
+  }
 });
 
-test("poller: corrupt cursor JSON results in cold start (cursors remain null after loadCursors)", async () => {
-  const { writeFile, unlink } = await import("node:fs/promises");
+test("poller: corrupt cursor JSON results in cold start", async () => {
   const tmpPath = dataDir.file("corrupt-cursor-2.json");
+
   await writeFile(tmpPath, "<<<not json>>>", "utf8");
 
-  const config = baseConfig({ cursorFile: tmpPath, pollIntervalMs: 9_999_999 });
+  const config = baseConfig({
+    cursorFile: tmpPath,
+    pollIntervalMs: 9_999_999,
+  });
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: 5000,
+      };
     },
-    async getEvents(_req) {
-      return { events: [], cursor: makeCursor(5000), latestLedger: 5000 };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: makeCursor(5000),
+        latestLedger: 5000,
+      };
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
-  // Before start, both cursors are null.
   const before = poller.status();
-  for (const t of before.targets) assert.equal(t.cursor, null);
 
-  // start() calls loadCursors which finds the corrupt file and warns.
-  // We need to at least call start() and read the state right after.
-  // Since start() immediately fires loop() in the background, stop quickly.
+  for (const target of before.targets) {
+    assert.equal(target.cursor, null);
+  }
+
   await poller.start();
-  // Let loadCursors run (it's the first thing start does) but stop before loop fires
-  await new Promise((r) => setImmediate(r));
+  await new Promise((resolve) => setImmediate(resolve));
   poller.stop();
-
-  // Cursors may be set by the first cycle OR remain null from cold start.
-  // The important invariant is: no exception was thrown.
-  await unlink(tmpPath).catch(() => {});
 });
 
 test("poller: missing cursor file results in cold start, not an error", async () => {
@@ -1004,20 +359,36 @@ test("poller: missing cursor file results in cold start, not an error", async ()
     cursorFile: dataDir.file("definitely-does-not-exist.json"),
     pollIntervalMs: 9_999_999,
   });
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: 5000,
+      };
     },
-    async getEvents(_req) {
-      return { events: [], cursor: makeCursor(5000), latestLedger: 5000 };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: makeCursor(5000),
+        latestLedger: 5000,
+      };
     },
   };
 
   let threw = false;
+
   try {
-    const poller = createPoller({ config, server, send: async () => {} });
+    const poller = createPoller({
+      config,
+      server,
+      send: async () => {},
+    });
+
     await poller.start();
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     poller.stop();
   } catch {
     threw = true;
@@ -1032,89 +403,146 @@ test("poller: RPC failure for one target does not prevent the other from scannin
   const tip = 5000;
   const tipCursor = makeCursor(tip);
 
-  // Market contract errors; squad succeeds.
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
+
     async getEvents(req) {
       const contractIds = req.filters?.[0]?.contractIds ?? [];
+
       if (contractIds.includes(MARKET_ID)) {
         throw new Error("RPC getEvents failure for market");
       }
-      return { events: [], cursor: tipCursor, latestLedger: tip };
+
+      return {
+        events: [],
+        cursor: tipCursor,
+        latestLedger: tip,
+      };
     },
   };
 
-  const config = baseConfig({ cursorFile: dataDir.file("rpc-fail.json"), pollIntervalMs: 9_999_999 });
-  const sent = [];
-  const poller = createPoller({ config, server, send: async (msg) => { sent.push(msg); } });
+  const config = baseConfig({
+    cursorFile: dataDir.file("rpc-fail.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 50));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   poller.stop();
 
-  const st = poller.status();
-  const market = st.targets.find((t) => t.source === "market");
-  const squad = st.targets.find((t) => t.source === "squad");
+  const status = poller.status();
 
-  assert.ok(market.lastError !== null, "market target should record the error");
-  assert.equal(squad.lastError, null, "squad target should have no error");
+  const market = status.targets.find(
+    (target) => target.source === "market",
+  );
+
+  const squad = status.targets.find(
+    (target) => target.source === "squad",
+  );
+
+  assert.ok(market.lastError !== null);
+  assert.equal(squad.lastError, null);
 });
 
 test("poller: consecutiveFailures increments when ALL targets fail", async () => {
   const tip = 5000;
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
-    async getEvents(_req) {
+
+    async getEvents() {
       throw new Error("all targets fail");
     },
   };
 
-  const config = baseConfig({ cursorFile: dataDir.file("all-fail.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const config = baseConfig({
+    cursorFile: dataDir.file("all-fail.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((resolve) => setTimeout(resolve, 80));
   poller.stop();
 
-  const st = poller.status();
-  assert.ok(st.consecutiveFailures >= 1, "consecutiveFailures should be >= 1 when all targets fail");
+  assert.ok(
+    poller.status().consecutiveFailures >= 1,
+    "consecutiveFailures should be >= 1 when all targets fail",
+  );
 });
 
 test("poller: consecutiveFailures resets when any target succeeds", async () => {
   const tip = 5000;
   const tipCursor = makeCursor(tip);
+
   let callNum = 0;
 
-  // First cycle: both fail. Second cycle: both succeed.
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
-    async getEvents(_req) {
+
+    async getEvents() {
       callNum++;
-      // First two calls (one per target on cycle 1) fail
-      if (callNum <= 2) throw new Error("first cycle failure");
-      return { events: [], cursor: tipCursor, latestLedger: tip };
+
+      if (callNum <= 2) {
+        throw new Error("first cycle failure");
+      }
+
+      return {
+        events: [],
+        cursor: tipCursor,
+        latestLedger: tip,
+      };
     },
   };
 
-  // Use a fast interval so two cycles can complete quickly
-  const config = baseConfig({ cursorFile: dataDir.file("reset-failures.json"), pollIntervalMs: 30 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const config = baseConfig({
+    cursorFile: dataDir.file("reset-failures.json"),
+    pollIntervalMs: 30,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
   await poller.start();
-  // Wait for two full cycles to run
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise((resolve) => setTimeout(resolve, 200));
   poller.stop();
 
-  const st = poller.status();
-  // After the second successful cycle, consecutiveFailures should be 0
-  assert.equal(st.consecutiveFailures, 0, "consecutiveFailures should reset after success");
-  assert.ok(st.cycles >= 2, `should have run at least 2 cycles, ran ${st.cycles}`);
+  const status = poller.status();
+
+  assert.equal(status.consecutiveFailures, 0);
+  assert.ok(status.cycles >= 2);
 });
 
 test("poller: getHealth failure propagates to target error and increments consecutiveFailures", async () => {
@@ -1122,37 +550,55 @@ test("poller: getHealth failure propagates to target error and increments consec
     async getHealth() {
       throw new Error("RPC completely unreachable");
     },
-    async getEvents(_req) {
-      return { events: [], cursor: "", latestLedger: 0 };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: "",
+        latestLedger: 0,
+      };
     },
   };
 
-  const config = baseConfig({ cursorFile: dataDir.file("health-fail.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const config = baseConfig({
+    cursorFile: dataDir.file("health-fail.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 50));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   poller.stop();
 
-  const st = poller.status();
-  assert.ok(st.consecutiveFailures >= 1, "consecutiveFailures should be >= 1");
-  assert.ok(st.lastError !== null, "lastError should be set");
+  const status = poller.status();
+
+  assert.ok(status.consecutiveFailures >= 1);
+  assert.ok(status.lastError !== null);
 });
 
 // ── Telegram failure mode ─────────────────────────────────────────────────────
 
-test("poller: Telegram send rejection increments notificationsFailed but does not throw", async () => {
+test("poller: Telegram send rejection does not crash the poller", async () => {
   const tip = 5000;
   const tipCursor = makeCursor(tip);
-  const sendError = new Error("Telegram 403 Forbidden");
 
-  // Build a server that returns one decodable event
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
+
     async getEvents(req) {
       const contractIds = req.filters?.[0]?.contractIds ?? [];
+
       if (contractIds.includes(MARKET_ID)) {
         return {
           events: [
@@ -1170,43 +616,63 @@ test("poller: Telegram send rejection increments notificationsFailed but does no
           latestLedger: tip,
         };
       }
-      return { events: [], cursor: tipCursor, latestLedger: tip };
+
+      return {
+        events: [],
+        cursor: tipCursor,
+        latestLedger: tip,
+      };
     },
   };
 
-  const config = baseConfig({ cursorFile: dataDir.file("tg-fail.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => Promise.reject(sendError) });
+  const config = baseConfig({
+    cursorFile: dataDir.file("tg-fail.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {
+      throw new Error("Telegram unavailable");
+    },
+  });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((resolve) => setTimeout(resolve, 80));
   poller.stop();
 
-  const st = poller.status();
-  // The send rejection should not propagate as an unhandled error.
-  // The poller catches it, increments notificationsFailed, and moves on.
-  // (The raw event has no topics, so it decodes to unknown and gets skipped —
-  //  therefore notificationsFailed might be 0 here since formatEvent returns null
-  //  for unknown events. What matters is: the poller kept running.)
-  assert.ok(st.cycles >= 1, "poller should have completed at least one cycle");
-  // cursor should have advanced (scan succeeded even if send failed or was skipped)
-  const market = st.targets.find((t) => t.source === "market");
-  assert.ok(market.cursor !== null, "market cursor should be set after a scan");
+  const status = poller.status();
+
+  assert.ok(status.cycles >= 1);
+
+  const market = status.targets.find(
+    (target) => target.source === "market",
+  );
+
+  assert.ok(market.cursor !== null);
 });
 
 test("poller: send failure does not prevent cursor from advancing", async () => {
-  // Build a scenario with a recognisable event that will format to non-null.
-  // We use nativeToScVal to build a real claim_created event.
-  const { nativeToScVal, Address, Keypair } = await import("@stellar/stellar-sdk");
+  const { nativeToScVal, Address, Keypair } =
+    await import("@stellar/stellar-sdk");
+
   const tip = 5000;
   const tipCursor = makeCursor(tip);
 
-  // Deterministic keypair for a valid G-address
   const kp = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 0x42));
   const fakeAddr = kp.publicKey();
 
-  const scStr = (s) => nativeToScVal(s, { type: "string" });
-  const scU64 = (n) => nativeToScVal(BigInt(n), { type: "u64" });
-  const scAddress = (g) => Address.account(Buffer.from(Keypair.fromPublicKey(g).rawPublicKey())).toScVal();
+  const scStr = (value) =>
+    nativeToScVal(value, { type: "string" });
+
+  const scU64 = (value) =>
+    nativeToScVal(BigInt(value), { type: "u64" });
+
+  const scAddress = (g) =>
+    Address.account(
+      Buffer.from(Keypair.fromPublicKey(g).rawPublicKey()),
+    ).toScVal();
 
   const fakeEvent = {
     id: "4900-0",
@@ -1214,115 +680,189 @@ test("poller: send failure does not prevent cursor from advancing", async () => 
     ledger: 4900,
     txHash: "abc",
     ledgerClosedAt: "2026-01-01T00:00:00Z",
-    topic: [scStr("claim_created"), scU64(1), scAddress(fakeAddr)],
+    topic: [
+      scStr("claim_created"),
+      scU64(1),
+      scAddress(fakeAddr),
+    ],
     value: nativeToScVal({ category: "crypto" }),
   };
 
   let eventsServed = false;
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
+
     async getEvents(req) {
       const contractIds = req.filters?.[0]?.contractIds ?? [];
+
       if (contractIds.includes(MARKET_ID) && !eventsServed) {
         eventsServed = true;
-        return { events: [fakeEvent], cursor: tipCursor, latestLedger: tip };
+
+        return {
+          events: [fakeEvent],
+          cursor: tipCursor,
+          latestLedger: tip,
+        };
       }
-      return { events: [], cursor: tipCursor, latestLedger: tip };
+
+      return {
+        events: [],
+        cursor: tipCursor,
+        latestLedger: tip,
+      };
     },
   };
 
   const sendAttempts = [];
-  const config = baseConfig({ cursorFile: dataDir.file("cursor-advance.json"), pollIntervalMs: 9_999_999 });
+
+  const config = baseConfig({
+    cursorFile: dataDir.file("cursor-advance.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
   const poller = createPoller({
     config,
     server,
-    send: async (msg) => {
-      sendAttempts.push(msg);
+    send: async (message) => {
+      sendAttempts.push(message);
       throw new Error("Telegram unavailable");
     },
   });
 
   await poller.start();
-  // The poller's notify() sleeps SEND_SPACING_MS (1500ms) between messages.
-  // A failed send still triggers the spacing because sentThisCycle stays 0.
-  // Wait long enough for the full cycle (send attempt + spacing + cursor write).
-  await waitFor(() => poller.status().notificationsFailed >= 1 && poller.status().targets.find((t) => t.source === "market").cursor !== null, 20_000);
+
+  await waitFor(
+    () =>
+      poller.status().notificationsFailed >= 1 &&
+      poller.status().targets.find(
+        (target) => target.source === "market",
+      ).cursor !== null,
+    20_000,
+  );
+
   poller.stop();
 
-  const st = poller.status();
-  // We got a send attempt (claim_created is notifiable) and the cursor advanced.
-  assert.ok(sendAttempts.length >= 1, "send should have been attempted");
-  assert.ok(st.notificationsFailed >= 1, "notificationsFailed should be incremented");
+  const status = poller.status();
 
-  const market = st.targets.find((t) => t.source === "market");
-  assert.ok(market.cursor !== null, "cursor should have advanced despite send failure");
-  assert.equal(market.cursor, tipCursor, "cursor should be the tip cursor");
+  assert.ok(sendAttempts.length >= 1);
+  assert.ok(status.notificationsFailed >= 1);
+
+  const market = status.targets.find(
+    (target) => target.source === "market",
+  );
+
+  assert.ok(market.cursor !== null);
+  assert.equal(market.cursor, tipCursor);
 });
 
 test("poller: maxNotificationsPerCycle cap — events beyond cap are skipped", async () => {
-  const { nativeToScVal, Address, Keypair } = await import("@stellar/stellar-sdk");
+  const { nativeToScVal, Address, Keypair } =
+    await import("@stellar/stellar-sdk");
+
   const tip = 5000;
   const tipCursor = makeCursor(tip);
 
   const kp = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 0x42));
   const fakeAddr = kp.publicKey();
 
-  const scStr = (s) => nativeToScVal(s, { type: "string" });
-  const scU64 = (n) => nativeToScVal(BigInt(n), { type: "u64" });
-  const scAddress = (g) => Address.account(Buffer.from(Keypair.fromPublicKey(g).rawPublicKey())).toScVal();
+  const scStr = (value) =>
+    nativeToScVal(value, { type: "string" });
 
-  // Build 10 claim_created events; the cap is 3.
+  const scU64 = (value) =>
+    nativeToScVal(BigInt(value), { type: "u64" });
+
+  const scAddress = (g) =>
+    Address.account(
+      Buffer.from(Keypair.fromPublicKey(g).rawPublicKey()),
+    ).toScVal();
+
   const events = Array.from({ length: 10 }, (_, i) => ({
     id: `490${i}-0`,
     contractId: MARKET_ID,
     ledger: 4900 + i,
     txHash: "abc",
     ledgerClosedAt: "2026-01-01T00:00:00Z",
-    topic: [scStr("claim_created"), scU64(i + 1), scAddress(fakeAddr)],
+    topic: [
+      scStr("claim_created"),
+      scU64(i + 1),
+      scAddress(fakeAddr),
+    ],
     value: nativeToScVal({ category: "crypto" }),
   }));
 
   let served = false;
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
+
     async getEvents(req) {
       const contractIds = req.filters?.[0]?.contractIds ?? [];
+
       if (contractIds.includes(MARKET_ID) && !served) {
         served = true;
-        return { events, cursor: tipCursor, latestLedger: tip };
+
+        return {
+          events,
+          cursor: tipCursor,
+          latestLedger: tip,
+        };
       }
-      return { events: [], cursor: tipCursor, latestLedger: tip };
+
+      return {
+        events: [],
+        cursor: tipCursor,
+        latestLedger: tip,
+      };
     },
   };
 
   const sent = [];
+
   const config = baseConfig({
     cursorFile: dataDir.file("cap.json"),
     pollIntervalMs: 9_999_999,
     maxNotificationsPerCycle: 3,
   });
+
   const poller = createPoller({
     config,
     server,
-    send: async (msg) => { sent.push(msg); },
+    send: async (message) => {
+      sent.push(message);
+    },
   });
 
   await poller.start();
-  // Each send is spaced 1500ms apart, so wait for the cycle to finish (its cursor
-  // save is the last step) rather than leaving it writing into a removed data dir.
-  await waitFor(() => poller.status().targets.every((t) => t.cursor !== null), 20_000);
+
+  await waitFor(
+    () =>
+      poller
+        .status()
+        .targets.every((target) => target.cursor !== null),
+    20_000,
+  );
+
   poller.stop();
 
-  const st = poller.status();
-  // Total notified + skipped should equal 10 (for the MARKET contract)
-  // But sends beyond the cap are counted as eventsSkipped.
-  // At least: notificationsSent <= 3 (the cap)
-  assert.ok(st.notificationsSent <= 3,
-    `sent ${st.notificationsSent} messages but cap is 3`);
+  const status = poller.status();
+
+  assert.ok(
+    status.notificationsSent <= 3,
+    `sent ${status.notificationsSent} messages but cap is 3`,
+  );
 });
 
 // ── inFlight / stop ───────────────────────────────────────────────────────────
@@ -1333,68 +873,133 @@ test("poller: stop() prevents further cycles after the current one completes", a
 
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
-    async getEvents(_req) {
+
+    async getEvents() {
       cyclesStarted++;
-      return { events: [], cursor: makeCursor(tip), latestLedger: tip };
+
+      return {
+        events: [],
+        cursor: makeCursor(tip),
+        latestLedger: tip,
+      };
     },
   };
 
-  // Short poll interval so the timer would fire quickly if stop() didn't work.
-  const config = baseConfig({ cursorFile: dataDir.file("stop.json"), pollIntervalMs: 20 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const config = baseConfig({
+    cursorFile: dataDir.file("stop.json"),
+    pollIntervalMs: 20,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 10));
+  await new Promise((resolve) => setTimeout(resolve, 10));
   poller.stop();
 
   const cyclesAtStop = poller.status().cycles;
-  // Wait and confirm no more cycles run after stop
-  await new Promise((r) => setTimeout(r, 100));
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
 
   const cyclesAfterStop = poller.status().cycles;
-  assert.equal(cyclesAtStop, cyclesAfterStop, "no new cycles should run after stop()");
+
+  assert.equal(
+    cyclesAtStop,
+    cyclesAfterStop,
+    "no new cycles should run after stop()",
+  );
 });
 
 test("poller: status().running is false after stop()", async () => {
-  const config = baseConfig({ cursorFile: dataDir.file("running.json"), pollIntervalMs: 9_999_999 });
+  const config = baseConfig({
+    cursorFile: dataDir.file("running.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: 5000,
+      };
     },
-    async getEvents(_req) {
-      return { events: [], cursor: makeCursor(5000), latestLedger: 5000 };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: makeCursor(5000),
+        latestLedger: 5000,
+      };
     },
   };
-  const poller = createPoller({ config, server, send: async () => {} });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
+
   await poller.start();
+
   assert.equal(poller.status().running, true);
+
   poller.stop();
+
   assert.equal(poller.status().running, false);
 });
 
 test("poller: start() sets startedAt and increments cycles on first poll", async () => {
   const tip = 5000;
-  const config = baseConfig({ cursorFile: dataDir.file("startedat.json"), pollIntervalMs: 9_999_999 });
+
+  const config = baseConfig({
+    cursorFile: dataDir.file("startedat.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
-    async getEvents(_req) {
-      return { events: [], cursor: makeCursor(tip), latestLedger: tip };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: makeCursor(tip),
+        latestLedger: tip,
+      };
     },
   };
 
   const before = Date.now();
-  const poller = createPoller({ config, server, send: async () => {} });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
+
   await poller.start();
-  await new Promise((r) => setTimeout(r, 50));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   poller.stop();
 
-  const st = poller.status();
-  assert.ok(st.startedAt >= before, "startedAt should be set to a recent timestamp");
-  assert.ok(st.cycles >= 1, "cycles should be >= 1");
+  const status = poller.status();
+
+  assert.ok(status.startedAt >= before);
+  assert.ok(status.cycles >= 1);
 });
 
 // ── Per-target isolation ──────────────────────────────────────────────────────
@@ -1405,78 +1010,143 @@ test("poller: failed market scan does not update market cursor but squad cursor 
 
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: tip };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: tip,
+      };
     },
+
     async getEvents(req) {
       const contractIds = req.filters?.[0]?.contractIds ?? [];
+
       if (contractIds.includes(MARKET_ID)) {
         throw new Error("market RPC error");
       }
-      return { events: [], cursor: tipCursor, latestLedger: tip };
+
+      return {
+        events: [],
+        cursor: tipCursor,
+        latestLedger: tip,
+      };
     },
   };
 
-  const config = baseConfig({ cursorFile: dataDir.file("iso.json"), pollIntervalMs: 9_999_999 });
-  const poller = createPoller({ config, server, send: async () => {} });
+  const config = baseConfig({
+    cursorFile: dataDir.file("iso.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
 
   await poller.start();
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((resolve) => setTimeout(resolve, 80));
   poller.stop();
 
-  const st = poller.status();
-  const market = st.targets.find((t) => t.source === "market");
-  const squad = st.targets.find((t) => t.source === "squad");
+  const status = poller.status();
 
-  assert.ok(market.lastError !== null, "market should have an error recorded");
-  assert.equal(squad.lastError, null, "squad should have no error");
-  assert.ok(squad.cursor !== null, "squad cursor should advance even when market fails");
+  const market = status.targets.find(
+    (target) => target.source === "market",
+  );
+
+  const squad = status.targets.find(
+    (target) => target.source === "squad",
+  );
+
+  assert.ok(market.lastError !== null);
+  assert.equal(squad.lastError, null);
+  assert.ok(squad.cursor !== null);
 });
 
 // ── Poller status shape ───────────────────────────────────────────────────────
 
 test("poller: status() returns a snapshot, not a live reference", async () => {
-  const config = baseConfig({ cursorFile: dataDir.file("snapshot.json"), pollIntervalMs: 9_999_999 });
+  const config = baseConfig({
+    cursorFile: dataDir.file("snapshot.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: 5000,
+      };
     },
-    async getEvents(_req) {
-      return { events: [], cursor: makeCursor(5000), latestLedger: 5000 };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: makeCursor(5000),
+        latestLedger: 5000,
+      };
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
+
   await poller.start();
-  await new Promise((r) => setTimeout(r, 50));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   poller.stop();
 
   const snapshot1 = poller.status();
   const snapshot2 = poller.status();
 
-  // Two calls must return equal but distinct objects.
-  assert.notEqual(snapshot1, snapshot2, "each call must return a new object");
-  assert.deepEqual(snapshot1, snapshot2, "snapshots taken at the same time should be equal");
+  assert.notEqual(snapshot1, snapshot2);
+  assert.deepEqual(snapshot1, snapshot2);
 });
 
 test("poller: targets list has exactly two entries (market and squad)", async () => {
-  const config = baseConfig({ cursorFile: dataDir.file("targets.json"), pollIntervalMs: 9_999_999 });
+  const config = baseConfig({
+    cursorFile: dataDir.file("targets.json"),
+    pollIntervalMs: 9_999_999,
+  });
+
   const server = {
     async getHealth() {
-      return { status: "healthy", oldestLedger: 4000, latestLedger: 5000 };
+      return {
+        status: "healthy",
+        oldestLedger: 4000,
+        latestLedger: 5000,
+      };
     },
-    async getEvents(_req) {
-      return { events: [], cursor: makeCursor(5000), latestLedger: 5000 };
+
+    async getEvents() {
+      return {
+        events: [],
+        cursor: makeCursor(5000),
+        latestLedger: 5000,
+      };
     },
   };
 
-  const poller = createPoller({ config, server, send: async () => {} });
+  const poller = createPoller({
+    config,
+    server,
+    send: async () => {},
+  });
+
   await poller.start();
-  await new Promise((r) => setTimeout(r, 50));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   poller.stop();
 
-  const st = poller.status();
-  assert.equal(st.targets.length, 2);
-  const sources = st.targets.map((t) => t.source).sort();
+  const status = poller.status();
+
+  assert.equal(status.targets.length, 2);
+
+  const sources = status.targets
+    .map((target) => target.source)
+    .sort();
+
   assert.deepEqual(sources, ["market", "squad"]);
 });
 

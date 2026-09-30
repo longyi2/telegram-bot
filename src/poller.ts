@@ -7,20 +7,8 @@
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
- *  - A failed Telegram send drops ONE message. The cursor still advances.
- *    That is deliberate: holding the cursor back on a send failure means a
- *    broken bot token or a chat the bot was kicked from turns into an infinite
- *    replay of the same events forever, and recovering floods the channel.
- *    Notifications are lossy by design; the chain remains the record.
- *  - A cursor file that cannot be read is treated as a cold start; one that
- *    cannot be written is logged, and the in-memory cursor keeps working until
- *    the next restart.
- *  - A cursor file with an unrecognised or missing version is treated as a cold
- *    start rather than silently misread.
- *  - A cursor whose ledger is far behind the RPC's retained floor triggers a
- *    warning, because events in the gap will never be posted.
- *  - Consecutive full-cycle failures are counted; a structured warning is
- *    emitted at thresholds so an operator can act before the bot falls silent.
+ *  - Each contract is paced independently. A slow or failing contract does not
+ *    block the scanning of other contracts.
  *  - A scan cursor is committed after its returned page has been processed,
  *    even when delivery was partial. Unknown events, the per-cycle cap, and
  *    exhausted Telegram retries are deliberate drops. Holding the cursor back
@@ -61,7 +49,7 @@
  * the only resume token, in the same `version: 1` format as before.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { rpc } from "@stellar/stellar-sdk";
@@ -74,7 +62,7 @@ import type { Metrics } from "./metrics.js";
 import type { SendExtra } from "./bot.js";
 import { appendAuditFile, auditEntry, createAuditLog, type AuditLog } from "./audit.js";
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, type BotConfig } from "./config.js";
-import { EventDedupWindow, eventKey } from "./dedup.js";
+import { EventDedupWindow } from "./dedup.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -105,7 +93,17 @@ export interface TargetState {
    * restart mid-rewind keeps reading from the floor rather than cold-starting.
    */
   rewindFromLedger: number | null;
+  /** RPC has rejected this target's cursor as stale; clears after a successful scan. */
+  cursorStale: boolean;
   lastError: string | null;
+  /**
+   * Consecutive successful cycles in which this target's cursor did not move
+   * while the cursor was still behind the tip. Reset the moment the cursor
+   * advances or catches up, so sitting idle at the tip never counts.
+   */
+  cyclesWithoutAdvance: number;
+  /** True once {@link CURSOR_STALL_CYCLES} non-advancing cycles have fired. */
+  cursorStalled: boolean;
 }
 
 export type PollerPauseResult = "paused" | "already-paused" | "stopped";
@@ -267,7 +265,21 @@ export interface SendOptions {
   maxSendRetries?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
+  /**
+   * Per-attempt timeout for a single Telegram send, in milliseconds. A send
+   * that does not settle within this window is treated as a failed attempt so
+   * one hung HTTP request cannot stall the whole poll cycle. Defaults to
+   * {@link DEFAULT_SEND_TIMEOUT_MS}.
+   */
+  sendTimeoutMs?: number;
 }
+
+/**
+ * Default per-attempt Telegram send timeout. Chosen to be comfortably longer
+ * than a healthy Telegram round trip but short enough that a hung socket is
+ * abandoned well before the next poll cycle would be due.
+ */
+export const DEFAULT_SEND_TIMEOUT_MS = 15_000 as const;
 
 export interface PollerDeps {
   config: BotConfig;
@@ -356,6 +368,21 @@ const DEFAULT_CIRCUIT_COOLDOWN_MS = 60_000;
 
 /** Telegram tolerates ~20 messages/minute to one chat; stay under it. */
 const DEFAULT_SEND_SPACING_MS = 1_500;
+
+/**
+ * Successful cycles with an unchanged cursor, while still behind the tip,
+ * before a stall is reported. At the default 30s interval this is ~2.5 minutes
+ * without progress — long enough that a burst of quiet ledgers is not a stall,
+ * short enough that an operator hears about a wedged `getEvents` walk quickly.
+ */
+export const CURSOR_STALL_CYCLES = 5;
+
+/**
+ * Minimum tip-minus-cursor ledger gap for an unchanged cursor to count as
+ * stalled. A gap of 0–1 is a bot sitting on the tip between ledgers, which is
+ * the healthy idle case.
+ */
+export const CURSOR_STALL_MIN_LAG_LEDGERS = 2;
 
 /** Maximum number of retry attempts for a single Telegram send. */
 const DEFAULT_MAX_SEND_RETRIES = 3;
@@ -925,7 +952,10 @@ export function createPoller(deps: PollerDeps) {
         cursor: null,
         lastEventLedger: null,
         rewindFromLedger: null,
+        cursorStale: false,
         lastError: null,
+        cyclesWithoutAdvance: 0,
+        cursorStalled: false,
       },
     ]),
   );
@@ -1058,6 +1088,7 @@ export function createPoller(deps: PollerDeps) {
         // A rewind that was still pending when the process stopped resumes from
         // the same floor instead of falling back to a lookback cold start.
         target.rewindFromLedger = saved.rewindFromLedger ?? null;
+        target.cursorStale = target.rewindFromLedger !== null;
         // Restore the redelivery window too. Without this a restart would
         // re-notify the last event the inclusive cursor hands back.
         dedup.set(key, EventDedupWindow.fromJSON(saved.recentEventIds, config.dedupWindow));
@@ -1199,6 +1230,57 @@ export function createPoller(deps: PollerDeps) {
       ...status,
       targets: [...state.values()].map((t) => ({ ...t })),
     });
+  }
+
+  /**
+   * Track whether a target's cursor is making progress.
+   *
+   * An unchanged cursor is only interesting when the walk is *behind* the tip:
+   * a bot sitting within {@link CURSOR_STALL_MIN_LAG_LEDGERS} of `latestLedger`
+   * is simply up to date, and a cold start that has not handed back a cursor yet
+   * has nothing to compare against. Anything else means the RPC kept returning
+   * the same resume token while the chain moved on, which is a pagination fault
+   * rather than a quiet chain. The warning fires once per stall, not every cycle.
+   */
+  function trackCursorAdvance(
+    target: TargetState,
+    previousCursor: string | null,
+    latestLedger: number,
+  ): void {
+    const cursor = target.cursor;
+    if (!cursor) {
+      target.cyclesWithoutAdvance = 0;
+      target.cursorStalled = false;
+      return;
+    }
+
+    const cursorLedger = eventCursorLedger(cursor);
+    const lag = cursorLedger === null ? 0 : latestLedger - cursorLedger;
+    const behindTip = lag >= CURSOR_STALL_MIN_LAG_LEDGERS;
+    const advanced = previousCursor !== cursor;
+    // The first cursor after a cold start is progress, not a stall.
+    const firstAssignment = previousCursor === null;
+
+    if (firstAssignment || advanced || !behindTip) {
+      target.cyclesWithoutAdvance = 0;
+      target.cursorStalled = false;
+      return;
+    }
+
+    target.cyclesWithoutAdvance += 1;
+    if (target.cyclesWithoutAdvance < CURSOR_STALL_CYCLES) return;
+
+    if (!target.cursorStalled) {
+      console.warn(
+        `[poller] CURSOR STALLED — ${target.source} cursor has not advanced for ` +
+          `${target.cyclesWithoutAdvance} successful cycles while ${lag} ledgers behind ` +
+          `tip ${latestLedger}` +
+          (cursorLedger !== null ? ` (cursor ledger ${cursorLedger})` : "") +
+          `. Check RPC getEvents pagination; cursor file ${config.cursorFile} is intact. ` +
+          `The bot will keep retrying; the chain remains the record.`,
+      );
+    }
+    target.cursorStalled = true;
   }
 
   // ── One cycle ──────────────────────────────────────────────────────────────
@@ -1502,6 +1584,9 @@ export function createPoller(deps: PollerDeps) {
     let cycleFailures = 0;
 
     try {
+      // Pace each contract independently: scan them sequentially but do not let
+      // a failure in one block the others. This ensures that if the "squad"
+      // contract is unreachable, the "market" contract is still polled.
       for (const target of targets) {
         const current = state.get(target.source);
         if (!current) continue;
@@ -1510,6 +1595,9 @@ export function createPoller(deps: PollerDeps) {
         try {
           const dedupWindow = dedup.get(target.source) ?? new EventDedupWindow(0);
           const rewinding = current.rewindFromLedger !== null;
+          // Read before the scan: the scan is what assigns the new cursor, and
+          // an unchanged value is exactly what a stall looks like.
+          const previousCursor = current.cursor;
           const scan = await withTimeout(
             readContractEvents(server, target, {
               // A pending floor rewind resumes by ledger, never by the stale
@@ -1537,6 +1625,7 @@ export function createPoller(deps: PollerDeps) {
           status.latestLedger = scan.latestLedger;
           status.oldestLedger = scan.oldestLedger;
           current.lastError = null;
+          current.cursorStale = false;
           anyOk = true;
 
           if (previousFailed) {
@@ -1615,10 +1704,15 @@ export function createPoller(deps: PollerDeps) {
           }
 
           let delivery: NotificationResult = { sent: 0, failed: 0, skipped: 0 };
+          // Record what the walk read BEFORE notifying: an event is
+          // "processed" once it is read, so a crash between send and save
+          // cannot replay it. The keys come from the reader's own window —
+          // derived from raw responses, where topic content still exists —
+          // because a decoded event alone cannot always re-derive the same
+          // key (it carries no `topic`), and an id-less event would otherwise
+          // never be recorded.
+          for (const id of scan.seenEventIds) dedupWindow.add(id);
           if (scan.events.length > 0) {
-            // Record before notifying: an event is "processed" once it has been
-            // read, so a crash between send and save cannot replay it.
-            for (const event of scan.events) dedupWindow.add(eventKey(event));
             markDirty();
             delivery = await notify(scan.events);
             const skippedText = delivery.skipped > 0 ? ` (${delivery.skipped} skipped)` : "";
@@ -1645,14 +1739,20 @@ export function createPoller(deps: PollerDeps) {
               );
             }
           }
+
+          trackCursorAdvance(current, previousCursor, scan.latestLedger);
         } catch (err) {
           cycleFailures++;
           const message = errorMessage(err);
+          const staleCursor = isStaleCursorError(message);
           current.lastError = message;
+          if (staleCursor) current.cursorStale = true;
           status.lastError = { at: now(), message: `${target.source}: ${message}` };
           audit.recordError(err, "cycle_failed", { source: target.source });
-          console.error(`[poller] ${target.source} scan failed: ${message}`);
-          if (isStaleCursorError(message)) {
+          console.error(
+            `[poller] ${target.source} scan failed${staleCursor ? " (stale cursor)" : ""}: ${message}`,
+          );
+          if (staleCursor) {
             audit.record(
               auditEntry("stale_cursor", {
                 source: target.source,
@@ -1790,6 +1890,17 @@ export function createPoller(deps: PollerDeps) {
 
   return {
     async start(): Promise<void> {
+      // Verify persistent volume availability before touching anything else.
+      const cursorDir = path.dirname(config.cursorFile);
+      try {
+        await mkdir(cursorDir, { recursive: true });
+        const probeFile = path.join(cursorDir, `.volume-probe.${process.pid}.${Date.now()}`);
+        await writeFile(probeFile, "", "utf8");
+        await unlink(probeFile).catch(() => {});
+      } catch (err) {
+        throw new Error(`Persistent volume is not writable: ${errorMessage(err)}`);
+      }
+
       // Refuse a second live process before touching the cursor or Telegram.
       // Configs built without a lock path keep it next to the cursor it guards.
       const lockFile = config.lockFile ?? path.join(path.dirname(config.cursorFile), "poller.lock");
