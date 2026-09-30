@@ -1,0 +1,653 @@
+{
+  "config": {
+    "chatIds": [ "-1001234567890"],
+    "marketContractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+    "squadContractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+    "rpcUrl": "https://example.invalid/rpc",
+    "horizonUrl": "https://example.invalid/horizon",
+    "networkPassphrase": "Test SDF Network ; September 2015"
+  },
+  "cases": [
+    {
+      "id": "claim_challenged_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "challenged",
+        "2\\.0000000 USDC",
+        "Challenger"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226692,
+        "txHash": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        "at": 1724000000,
+        "eventId": "4226692-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 7,
+          "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "stake": "20000000"
+        }
+      }
+    },
+    {
+      "id": "claim_created_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "New claim",
+        "crypto",
+        "Creator"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226691,
+        "txHash": "",
+        "at": 1724000001,
+        "eventId": "4226691-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 7,
+          "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "category": "crypto"
+        }
+      }
+    },
+    {
+      "id": "claim_resolved_with_summary",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "resolved",
+        "challengers",
+        "Confidence"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226728,
+        "txHash": "",
+        "at": 1724000002,
+        "eventId": "4226728-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 7,
+          "winnerSide": 2,
+          "summary": "Onchain smoke \u2014 challengers awarded",
+          "confidence": 100,
+          "evidenceHash": "deadbeef"
+        }
+      }
+    },
+    {
+      "id": "claim_cancelled_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "cancelled",
+        "stakes returned"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226800,
+        "txHash": "",
+        "at": 1724001000,
+        "eventId": "4226800-0",
+        "payload": {
+          "name": "claim_cancelled",
+          "claimId": 12
+        }
+      }
+    },
+    {
+      "id": "market_settled_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "settled",
+        "Paid out",
+        "fees"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226900,
+        "txHash": "",
+        "at": 1724002000,
+        "eventId": "4226900-0",
+        "payload": {
+          "name": "market_settled",
+          "claimId": 7,
+          "totalPaid": "180000000",
+          "totalFees": "20000000",
+          "owedToChallengers": "160000000",
+          "dust": "0"
+        }
+      }
+    },
+    {
+      "id": "challenger_paid_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Challenger paid",
+        "staked",
+        "net"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226901,
+        "txHash": "",
+        "at": 1724002001,
+        "eventId": "4226901-0",
+        "payload": {
+          "name": "challenger_paid",
+          "claimId": 7,
+          "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "stake": "20000000",
+          "gross": "38000000",
+          "fee": "2000000",
+          "net": "36000000"
+        }
+      }
+    },
+    {
+      "id": "fee_claimed_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Fees claimed"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4226950,
+        "txHash": "",
+        "at": 1724003000,
+        "eventId": "4226950-0",
+        "payload": {
+          "name": "fee_claimed",
+          "recipient": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "5000000"
+        }
+      }
+    },
+    {
+      "id": "withdrawal_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Withdrawal"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4227000,
+        "txHash": "",
+        "at": 1724004000,
+        "eventId": "4227000-0",
+        "payload": {
+          "name": "withdrawal",
+          "to": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "50000000"
+        }
+      }
+    },
+    {
+      "id": "withdrawal_pending_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "parked",
+        "claimable"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 4227001,
+        "txHash": "",
+        "at": 1724004001,
+        "eventId": "4227001-0",
+        "payload": {
+          "name": "withdrawal_pending",
+          "to": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "30000000"
+        }
+      }
+    },
+    {
+      "id": "squad_resolved_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "resolved",
+        "Side A",
+        "Pools"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 4227100,
+        "txHash": "",
+        "at": 1724005000,
+        "eventId": "4227100-0",
+        "payload": {
+          "name": "resolved",
+          "marketId": 3,
+          "result": 1,
+          "poolA": "100000000",
+          "poolB": "80000000"
+        }
+      }
+    },
+    {
+      "id": "squad_claimed_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Squad payout",
+        "net"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 4227101,
+        "txHash": "",
+        "at": 1724005001,
+        "eventId": "4227101-0",
+        "payload": {
+          "name": "claimed",
+          "marketId": 3,
+          "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "gross": "50000000",
+          "fee": "1000000",
+          "net": "49000000"
+        }
+      }
+    },
+    {
+      "id": "squad_withdrawn_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Squad",
+        "pulled",
+        "Side B"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 4227102,
+        "txHash": "",
+        "at": 1724005002,
+        "eventId": "4227102-0",
+        "payload": {
+          "name": "withdrawn",
+          "marketId": 3,
+          "side": 2,
+          "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "10000000"
+        }
+      }
+    },
+    {
+      "id": "squad_fees_claimed_happy",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Squad fees claimed"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 4227103,
+        "txHash": "",
+        "at": 1724005003,
+        "eventId": "4227103-0",
+        "payload": {
+          "name": "fees_claimed",
+          "recipient": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "3000000"
+        }
+      }
+    },
+    {
+      "id": "unknown_malformed_amount",
+      "kind": "negative",
+      "expect": "skip",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 44,
+        "txHash": "",
+        "at": 0,
+        "eventId": "44-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "claim_challenged",
+          "reason": "malformed amount"
+        }
+      }
+    },
+    {
+      "id": "admin_shaped_unknown",
+      "kind": "negative",
+      "expect": "skip",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 50,
+        "txHash": "",
+        "at": 0,
+        "eventId": "50-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "oracle_changed",
+          "reason": "admin event"
+        }
+      }
+    },
+    {
+      "id": "negative_stake_amount_unknown",
+      "kind": "negative",
+      "expect": "skip",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 51,
+        "txHash": "",
+        "at": 0,
+        "eventId": "51-0",
+        "payload": {
+          "name": "unknown",
+          "eventName": "claim_challenged",
+          "reason": "claim_challenged.stake: expected non-negative amount, got -20000000"
+        }
+      }
+    },
+    {
+      "id": "category_markdown_reserved",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "New claim",
+        "\\*",
+        "\\_"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 42,
+        "txHash": "",
+        "at": 0,
+        "eventId": "42-0",
+        "payload": {
+          "name": "claim_created",
+          "claimId": 9,
+          "creator": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "category": "a*_b"
+        }
+      }
+    },
+    {
+      "id": "zero_stake_challenged",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "0\\.0000000 USDC"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 60,
+        "txHash": "",
+        "at": 0,
+        "eventId": "60-0",
+        "payload": {
+          "name": "claim_challenged",
+          "claimId": 1,
+          "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "stake": "0"
+        }
+      }
+    },
+    {
+      "id": "long_summary_clipped",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "resolved",
+        "\u2026"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 70,
+        "txHash": "",
+        "at": 0,
+        "eventId": "70-0",
+        "payload": {
+          "name": "claim_resolved",
+          "claimId": 3,
+          "winnerSide": 1,
+          "summary": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+          "confidence": 50,
+          "evidenceHash": "00"
+        }
+      }
+    },
+    {
+      "id": "market_settled_zero_dust",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "settled",
+        "0\\.0000000 USDC"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 71,
+        "txHash": "",
+        "at": 0,
+        "eventId": "71-0",
+        "payload": {
+          "name": "market_settled",
+          "claimId": 10,
+          "totalPaid": "100000000",
+          "totalFees": "0",
+          "owedToChallengers": "100000000",
+          "dust": "0"
+        }
+      }
+    },
+    {
+      "id": "challenger_paid_equal_gross_net",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "Challenger paid",
+        "net"
+      ],
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 72,
+        "txHash": "",
+        "at": 0,
+        "eventId": "72-0",
+        "payload": {
+          "name": "challenger_paid",
+          "claimId": 10,
+          "challenger": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "stake": "20000000",
+          "gross": "20000000",
+          "fee": "0",
+          "net": "20000000"
+        }
+      }
+    },
+    {
+      "id": "squad_resolved_cancelled",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "resolved",
+        "cancelled"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 73,
+        "txHash": "",
+        "at": 0,
+        "eventId": "73-0",
+        "payload": {
+          "name": "resolved",
+          "marketId": 5,
+          "result": 3,
+          "poolA": "0",
+          "poolB": "0"
+        }
+      }
+    },
+    {
+      "id": "squad_claimed_zero_fee",
+      "kind": "boundary",
+      "expect": "notify",
+      "messageIncludes": [
+        "Squad payout"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 74,
+        "txHash": "",
+        "at": 0,
+        "eventId": "74-0",
+        "payload": {
+          "name": "claimed",
+          "marketId": 5,
+          "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "gross": "10000000",
+          "fee": "0",
+          "net": "10000000"
+        }
+      }
+    },
+    {
+      "id": "squad_market_created",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "squad market",
+        "Will X happen",
+        "Captain"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 80,
+        "txHash": "",
+        "at": 1724000100,
+        "eventId": "80-0",
+        "payload": {
+          "name": "market_created",
+          "marketId": 2,
+          "captain": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "deadline": 1725000000,
+          "feeBps": 100,
+          "question": "Will X happen?"
+        }
+      }
+    },
+    {
+      "id": "squad_deposit",
+      "kind": "positive",
+      "expect": "notify",
+      "messageIncludes": [
+        "Squad",
+        "Side A",
+        "1\\.0000000 USDC"
+      ],
+      "event": {
+        "source": "squad",
+        "contractId": "CFIXTURESQUAD0000000000000000000000000000000000000000000",
+        "ledger": 81,
+        "txHash": "",
+        "at": 1724000101,
+        "eventId": "81-0",
+        "payload": {
+          "name": "deposited",
+          "marketId": 2,
+          "side": 1,
+          "participant": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVW",
+          "amount": "10000000",
+          "shares": "10000000"
+        }
+      }
+    },
+    {
+      "id": "rpc_failure_cursor_invariant",
+      "kind": "restart",
+      "expect": "skip",
+      "description": "Documents that after an RPC failure the cursor is left unchanged. The poller logs the error and skips that contract for the cycle.",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 0,
+        "txHash": "",
+        "at": 0,
+        "eventId": "rpc-failure",
+        "payload": {
+          "name": "unknown",
+          "eventName": "",
+          "reason": "RPC unavailable — cursor left unchanged"
+        }
+      }
+    },
+    {
+      "id": "telegram_failure_cursor_advances",
+      "kind": "restart",
+      "expect": "skip",
+      "description": "Documents that after a Telegram send failure the cursor still advances. Notifications are lossy by design; the chain is the record.",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 0,
+        "txHash": "",
+        "at": 0,
+        "eventId": "tg-failure",
+        "payload": {
+          "name": "unknown",
+          "eventName": "",
+          "reason": "Telegram send failed — cursor advances anyway"
+        }
+      }
+    },
+    {
+      "id": "burst_cap_extras_skipped",
+      "kind": "restart",
+      "expect": "skip",
+      "description": "Documents that events beyond MAX_NOTIFICATIONS_PER_CYCLE are skipped. The cursor still advances so the bot does not get stuck.",
+      "event": {
+        "source": "market",
+        "contractId": "CFIXTUREMARKET00000000000000000000000000000000000000000",
+        "ledger": 0,
+        "txHash": "",
+        "at": 0,
+        "eventId": "burst-cap",
+        "payload": {
+          "name": "unknown",
+          "eventName": "",
+          "reason": "burst cap reached — event skipped, cursor advances"
+        }
+      }
+    }
+  ]
+}

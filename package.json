@@ -14,8 +14,38 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test tests/format.test.mjs",
+    "test": "npm run build && node --test tests/format.test.mjs tests/config.test.mjs tests/poller.test.mjs tests/metrics.test.mjs",
     "scan": "tsx src/stellar/events.ts"
+    "lockfile:check": "node scripts/check-lockfile.mjs",
+    "lockfile:reproduce": "node scripts/check-lockfile.mjs --reproduce",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "test:mock": "npm run build && node --test tests/mock-*.test.mjs",
+    "scan": "tsx src/stellar/events.ts",
+    "scan:mock": "tsx src/stellar/events.ts --mock",
+    "mock:rpc": "tsx src/stellar/mock-rpc.ts",
+    "mock:poll": "tsx src/mock-run.ts",
+    "audit": "tsx src/audit-cli.ts",
+    "audit:report": "tsx src/audit-cli.ts",
+    "seed:cursor": "tsx src/dev/seedCursor.ts",
+    "cursor": "node dist/cursor-cli.js",
+    "replay": "tsx src/replay-cli.ts",
+    "replay:mock": "tsx src/replay-cli.ts --mock"
+  },
+  "c8": {
+    "all": true,
+    "include": [
+      "src/**/*.ts"
+    ],
+    "exclude": [
+      "src/index.ts",
+      "src/stellar/events.ts",
+      "src/stellar/client.ts"
+    ],
+    "check-coverage": true,
+    "lines": 80,
+    "statements": 80,
+    "functions": 80,
+    "branches": 80
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.2.0",
@@ -24,6 +54,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
+    "c8": "^10.1.2",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   }
