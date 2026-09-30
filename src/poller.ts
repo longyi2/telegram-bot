@@ -3,7 +3,10 @@
  *
  * ── Failure policy ───────────────────────────────────────────────────────────
  *
- * This process is meant to stay up for weeks. Nothing in one cycle may end it:
+ * This process is meant to stay up for weeks. Nothing in one cycle may end it
+ * *unless* a supervisor is present and the failure count crosses the configured
+ * threshold, at which point a deliberate exit (code 3) hands control back to
+ * the supervisor for a clean restart with fresh connections and reset state.
  *
  *  - A failed RPC call fails ONE contract's scan for ONE cycle. Its cursor is
  *    left untouched, so the next cycle picks up exactly where it stopped.
@@ -1080,6 +1083,21 @@ export function buildDigests(
   return digests;
 }
 
+/**
+ * If the error looks like a Telegram 429, return the number of seconds to
+ * wait before the next request (from `parameters.retry_after`), otherwise
+ * return null.
+ */
+function telegram429RetryAfter(err: unknown): number | null {
+  if (!(err instanceof Error)) return null;
+  // grammy wraps Telegram errors as GrammyError with an `error_code` property.
+  const maybe = err as { error_code?: unknown; parameters?: { retry_after?: unknown } };
+  if (maybe.error_code !== 429) return null;
+  const retryAfter = maybe.parameters?.retry_after;
+  if (typeof retryAfter === "number" && retryAfter > 0) return retryAfter;
+  return TELEGRAM_429_BACKOFF_MS / 1000;
+}
+
 export function createPoller(deps: PollerDeps) {
   const { config, server, send } = deps;
   const metrics = deps.metrics;
@@ -2076,6 +2094,11 @@ for (const event of knownEvents) {
 
         status.latestLedger = scan.latestLedger;
         status.oldestLedger = scan.oldestLedger;
+
+        // Stale-cursor check runs on every successful scan so it catches the
+        // condition even when the cursor has not moved (empty pages).
+        checkStaleCursor(current, scan.oldestLedger);
+
         current.lastError = null;
         anyOk = true;
         metrics?.rpcRequests.inc();

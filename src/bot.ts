@@ -167,6 +167,15 @@ export function statusMessage(config: BotConfig, status: PollerStatus, nowMs: nu
     if (target.lastError) lines.push(`  last error: ${escapeMd(target.lastError)}`);
   }
 
+  if (status.consecutiveFailures > 0) {
+    const backoffSec = Math.round(status.currentBackoffMs / 1000);
+    lines.push(
+      "",
+      `⚠️ *${status.consecutiveFailures} consecutive failed cycle${status.consecutiveFailures === 1 ? "" : "s"}*` +
+        (backoffSec > 0 ? ` · back\\-off ${escapeMd(String(backoffSec))}s` : ""),
+    );
+  }
+
   if (status.lastError) {
     lines.push(
       "",
