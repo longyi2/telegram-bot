@@ -18,6 +18,12 @@ does not receive an explorer link. The original event is still decoded and the
 cursor follows the normal poller rules; truncation affects only the Telegram
 presentation, not chain data or persisted cursor state.
 
+Notification text from contract String fields is bounded to 200 Unicode code
+points before MarkdownV2 escaping. An oversized or malformed transaction hash
+does not receive an explorer link. The original event is still decoded and the
+cursor follows the normal poller rules; truncation affects only the Telegram
+presentation, not chain data or persisted cursor state.
+
 ## Quick health check
 
 Run:
@@ -45,6 +51,11 @@ Check:
 * poll/send counters, including automatic floor rewinds (`cursorRewinds`)
 * any target resuming from a floor rewind (`rewindFromLedger`)
 * last error and consecutive failure count
+
+The correlation ID identifies the most recently started poll cycle. Use it to
+group the bounded scan, malformed-event, rate-limit, send, and cycle-error log
+lines for that cycle. A new process creates new IDs; they are intentionally not
+stored in the version-1 cursor file or sent to Telegram.
 
 For a read-only chain diagnostic without a Telegram token:
 
@@ -100,6 +111,7 @@ An operator pause is reported as healthy by `/health` with `poller.paused=true`.
 ### Symptoms
 
 * `/status` reports a recent RPC error.
+* `/export` shows the per-target `[poller] … scan failed` lines leading up to it.
 * One contract stops advancing while the other continues.
 * Notifications from one contract are missing.
 
@@ -121,6 +133,8 @@ Do not manually advance the cursor to skip an RPC failure.
 * Event scanning continues but sends fail.
 * `/status` shows send errors or an increasing scan/send difference.
 * The bot was removed from the chat or its token was revoked.
+* `/export` shows the bounded send-retry warnings and the final
+  `send failed … after retries` line, with the token itself always masked.
 
 ### Recovery
 
@@ -131,9 +145,12 @@ Do not manually advance the cursor to skip an RPC failure.
 
 Telegram delivery is intentionally lossy. The poller commits the opaque cursor
 after processing the returned page, even when sends are partial. A failed send
-does not hold the cursor back because replaying every missed notification could
-create an unbounded backlog or flood a recovered chat. The log reports the
-sent/failed/skipped counts for that commit.
+does not hold the cursor back — holding it would turn a revoked token into an
+infinite replay, and replaying every missed notification could create an
+unbounded backlog or flood a recovered chat. Instead the formatted message is
+parked on the local dead-letter queue (`DEAD_LETTER_FILE`, default
+`data/dead-letter.json`) and replayed on later cycles once Telegram accepts
+sends again. The log reports the sent/failed/skipped counts for that commit.
 
 Each individual Telegram send is bounded by `TELEGRAM_SEND_TIMEOUT_MS` (default
 `10000`). A send that exceeds this deadline is aborted and counted as a failure
@@ -277,6 +294,8 @@ After a restart:
 2. Confirm the persisted cursor is present.
 3. Confirm polling resumes normally.
 4. Check that counters and last-event ledgers begin advancing again.
+5. Check for a restart gap (see [Restart gaps](#restart-gaps)): a downtime longer
+   than the RPC's retained window shows up there, not as an error.
 
 ### Ephemeral deployment
 
@@ -301,7 +320,9 @@ Do not delete `/app/data` cursor state as part of a normal rollback.
 
 ## Rate limiting
 
-Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE` and spaced out.
+Notification bursts are bounded by `MAX_NOTIFICATIONS_PER_CYCLE`: each cycle
+reads one RPC page of that size, commits its page cursor, and then spaces sends
+out. A restart therefore replays at most one bounded page.
 
 If Telegram rate limits are observed:
 
@@ -319,7 +340,17 @@ Do not manually replay large event ranges into Telegram.
 
 ## Malformed or unexpected events
 
-A malformed event must not crash the long-running process.
+A malformed event must not crash the long-running process. XDR conversion and
+event metadata failures are converted to a skipped `unknown` event with a
+bounded reason. The RPC response cursor is retained, so later events in the
+page and later pages remain eligible for processing; no cursor rewind or
+guessed ledger is performed.
+
+`decodeEvent` converts malformed XDR and events introduced by a newer contract
+deployment into a bounded `unknown` record. The poller logs only the contract,
+event name, ledger, and a clipped reason, skips Telegram delivery for that
+event, and continues with the RPC cursor returned by the scan. This protects
+the long-running reader while preserving the chain as the source of truth.
 
 `decodeEvent` converts malformed XDR and events introduced by a newer contract
 deployment into a bounded `unknown` record. The poller logs only the contract,
@@ -331,7 +362,7 @@ When investigating:
 
 1. Use `npm run scan` to inspect the affected event range.
 2. Confirm the contract and ledger involved.
-3. Check the decoded event output without copying unrestricted remote payloads into logs or tickets.
+3. Check the bounded event name and decode reason without copying unrestricted remote payloads into logs or tickets.
 4. Preserve the existing cursor behavior.
 
 Do not modify on-chain state or attempt to repair an event by writing to the Mimir contracts.
@@ -395,6 +426,7 @@ Before deployment:
 * `data/` or `CURSOR_FILE` is persistent — on Railway, a volume attached at `/app/data` (see `railway.json`).
 * The deployed revision passes typecheck and build checks.
 * No production credentials are committed.
+* Confirm the expected version appears in `GET /health` (`"version"` field) and in the `[boot]` log line after startup.
 
 After deployment:
 
@@ -404,6 +436,7 @@ After deployment:
   intended — for a deployment with a `.env`, `envFile.present: true` and the
   bot token's source reported as `env-file`, not `profile-default`.
 * Confirm the expected contract IDs and cursor are shown.
+* Record the latest correlation ID when investigating a specific poll cycle.
 * Confirm the last event ledger advances after new events.
 * Monitor RPC and Telegram errors.
 
@@ -457,7 +490,40 @@ npm run build
 npm test
 ```
 
-Also verify the command-level diagnostic path where applicable:
+### Incident drill simulation
+
+Exercise the automated incident drill script to verify notifier resilience across simulated RPC failures, Telegram delivery failures, stale/corrupt cursors, bursts, restarts, and malformed events without requiring live Testnet or Telegram credentials:
+
+```bash
+npm run drill
+```
+
+Or run via the scanner CLI:
+
+```bash
+npm run scan -- --drill
+```
+
+Specific failure modes can be drilled individually:
+
+```bash
+npm run drill -- --scenario rpc-failure
+npm run drill -- --scenario telegram-failure
+npm run drill -- --scenario stale-cursor
+npm run drill -- --scenario corrupt-cursor
+npm run drill -- --scenario malformed-event
+npm run drill -- --scenario rate-limit
+npm run drill -- --scenario restart
+npm run drill -- --scenario scanner-diagnostic
+```
+
+Machine-readable JSON reporting is supported:
+
+```bash
+npm run drill -- --json
+```
+
+Also verify the command-level diagnostic path against live Testnet where applicable:
 
 ```bash
 npm run scan

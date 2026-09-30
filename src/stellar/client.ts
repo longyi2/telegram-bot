@@ -15,27 +15,80 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
-import { networkLabel } from "../config.js";
 
-export function createRpcServer(config: StellarConfig): rpc.Server {
-  return new rpc.Server(config.rpcUrl, {
+/** Soroban contract strkey: `C` + 55 base32 characters. */
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+
+/**
+ * Validate that a contract ID is a well-formed Soroban strkey.
+ * Returns true if valid; throws an error with a descriptive message if not.
+ * Kept as a runtime check so the poller can catch misconfigurations early
+ * before a scan attempt and log actionable diagnostics.
+ */
+export function validateContractId(contractId: string, fieldName: string = "contract ID"): boolean {
+  const trimmed = contractId.trim();
+  if (trimmed === "") {
+    throw new Error(`${fieldName} is empty`);
+  }
+  if (!CONTRACT_ID_PATTERN.test(trimmed)) {
+    throw new Error(
+      `${fieldName} is not a valid Soroban contract ID (expected C… strkey, 56 chars); got "${trimmed}"`,
+    );
+  }
+  return true;
+}
+
+export class RpcPassphraseError extends Error {
+  constructor(expected: string, actual: string) {
+    super(
+      `RPC network passphrase mismatch: expected "${expected}" but RPC reported "${actual}". ` +
+      `Check STELLAR_RPC_URL and STELLAR_NETWORK_PASSPHRASE configuration.`,
+    );
+    this.name = "RpcPassphraseError";
+  }
+}
+
+/**
+ * Create an RPC server and verify its network passphrase matches the configured value.
+ * This fail-fast check at boot prevents silent misconfigurations where the bot reads
+ * events from the wrong network.
+ *
+ * Throws RpcPassphraseError if the passphrase does not match.
+ */
+export async function createRpcServer(config: StellarConfig): Promise<rpc.Server> {
+  const server = new rpc.Server(config.rpcUrl, {
     // Only relevant for a local quickstart container on plain http.
     allowHttp: new URL(config.rpcUrl).protocol === "http:",
     timeout: 15000,
   });
+
+  // Verify the RPC's passphrase matches the configured one. This is a fail-fast
+  // check that prevents configuration errors from silently producing wrong results.
+  const network = await server.getNetwork();
+  if (network.passphrase !== config.networkPassphrase) {
+    throw new RpcPassphraseError(config.networkPassphrase, network.passphrase);
+  }
+
+  return server;
 }
 
 /** Default stellar.expert origin; override with STELLAR_EXPLORER_BASE_URL. */
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
 
 /**
- * Resolve the explorer network path segment from the configured passphrase.
- * Custom / unknown networks fall back to `testnet` so links stay usable in
- * local quickstart deployments.
+ * Resolve the explorer network path segment from the configured network name.
+ * `futurenet` and `custom` fall back to `testnet` so links remain usable in
+ * local and non-standard deployments. Falls back to passphrase inference when
+ * the `network` field is absent (e.g. in tests that predate multi-network support).
  */
 export function explorerNetworkSegment(config: StellarConfig): "public" | "testnet" {
-  const label = networkLabel(config);
-  return label === "public" ? "public" : "testnet";
+  const net = config.network ?? inferFromPassphrase(config.networkPassphrase);
+  return net === "mainnet" ? "public" : "testnet";
+}
+
+function inferFromPassphrase(passphrase: string): string {
+  if (passphrase === "Public Global Stellar Network ; September 2015") return "mainnet";
+  return "testnet";
 }
 
 function explorerBase(config: StellarConfig): string {
@@ -49,8 +102,14 @@ function explorerPart(value: string): string {
 
 /** Explorer link for a transaction hash, used in notification footers. */
 export function txExplorerUrl(config: StellarConfig, txHash: string): string {
+  const network =
+    config.networkPassphrase === "Public Global Stellar Network ; September 2015"
+      ? "public"
+      : "testnet";
+  return `https://stellar.expert/explorer/${network}/tx/${txHash}`;
+}
   const hash = txHash.trim();
-  if (!hash) return "";
+  if (!hash || !/^[a-fA-F0-9]{64}$/.test(hash)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/tx/${explorerPart(hash)}`;
 }
@@ -58,7 +117,7 @@ export function txExplorerUrl(config: StellarConfig, txHash: string): string {
 /** Explorer link for a classic / contract account. */
 export function accountExplorerUrl(config: StellarConfig, address: string): string {
   const id = address.trim();
-  if (!id) return "";
+  if (!id || !/^[GC][A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/account/${explorerPart(id)}`;
 }
@@ -66,7 +125,7 @@ export function accountExplorerUrl(config: StellarConfig, address: string): stri
 /** Explorer link for a Soroban contract id, used by /contracts. */
 export function contractExplorerUrl(config: StellarConfig, contractId: string): string {
   const id = contractId.trim();
-  if (!id) return "";
+  if (!id || !/^C[A-Z2-7]{55}$/.test(id)) return "";
   const network = explorerNetworkSegment(config);
   return `${explorerBase(config)}/${network}/contract/${explorerPart(id)}`;
 }
@@ -98,6 +157,27 @@ export type LedgerWindowProblem =
   | "start-after-tip"
   | "cursor-after-tip";
 
+/** Why the RPC network passphrase cannot be verified. */
+export type NetworkPassphraseProblem = "mismatch" | "missing" | "malformed";
+
+/**
+ * Raised when the RPC's reported network passphrase does not match the
+ * configured value. This is a safety-critical misconfiguration: either the
+ * RPC is pointed at the wrong network, or the configuration itself is wrong.
+ *
+ * The error message is bounded and never contains the actual passphrases,
+ * so it can be surfaced in logs and status output without leaking secrets.
+ */
+export class NetworkPassphraseMismatchError extends Error {
+  readonly problem: NetworkPassphraseProblem;
+
+  constructor(problem: NetworkPassphraseProblem, message: string) {
+    super(message);
+    this.name = "NetworkPassphraseMismatchError";
+    this.problem = problem;
+  }
+}
+
 /**
  * Raised for a ledger-window bound that is invalid before any request is sent.
  *
@@ -111,6 +191,82 @@ export class LedgerWindowError extends Error {
     super(message);
     this.name = "LedgerWindowError";
     this.problem = problem;
+  }
+}
+
+// ── Contract ID validation ───────────────────────────────────────────────────
+//
+// Contract IDs are loaded at config time and validated there. Runtime validation
+// is added as a defense-in-depth check before they're used in RPC filters, so
+// a malformed ID cannot reach the RPC or corrupt the filter chain.
+//
+// The validation error is bounded by construction — never including raw payloads
+// — so it can be safely logged, surfaced in /status, and included in audit trails.
+
+/** Why a contract ID is invalid. */
+export type ContractIdProblem = "malformed-format" | "empty-value";
+
+/**
+ * Raised when a contract ID fails validation before being sent to the RPC.
+ *
+ * The message is bounded by construction, so it can be surfaced in `/status`,
+ * in logs, and by the scanner CLI without copying a remote payload or the
+ * malformed contract ID itself.
+ */
+export class ContractIdError extends Error {
+  readonly problem: ContractIdProblem;
+
+  constructor(problem: ContractIdProblem, message: string) {
+    super(message);
+    this.name = "ContractIdError";
+    this.problem = problem;
+  }
+}
+
+/** Soroban contract ID format: C + 55 base32 characters (strkey). */
+const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/**
+ * Truncate a contract ID to a safe, bounded form for logging.
+ * Returns the first character and the last 4 characters: C…XXXX
+ */
+function truncatedContractId(contractId: string): string {
+  if (typeof contractId !== "string") return "C…???";
+  const trimmed = contractId.trim();
+  if (trimmed.length === 0) return "C…(empty)";
+  if (trimmed.length <= 5) return `${trimmed[0]}…`;
+  return `${trimmed[0]}…${trimmed.slice(-4)}`;
+}
+
+/**
+ * Validate a contract ID before it is used in an RPC request.
+ *
+ * Throws a bounded {@link ContractIdError} when the ID is empty, malformed, or
+ * not a string, rather than letting it reach the RPC or corrupt the filter.
+ * Used at the boundary where contract IDs enter RPC requests.
+ *
+ * @param contractId - The contract ID to validate (typically from config)
+ * @throws {ContractIdError} When the contract ID is invalid
+ */
+export function validateContractId(contractId: unknown): void {
+  if (typeof contractId !== "string") {
+    throw new ContractIdError(
+      "empty-value",
+      `contract ID must be a string; got ${typeof contractId}`,
+    );
+  }
+
+  const trimmed = contractId.trim();
+  if (trimmed === "") {
+    throw new ContractIdError("empty-value", "contract ID cannot be empty");
+  }
+
+  if (!CONTRACT_ID_RE.test(trimmed)) {
+    throw new ContractIdError(
+      "malformed-format",
+      `contract ID is not a Soroban contract ID (expected C… strkey, 56 chars); ` +
+        `got ${truncatedContractId(trimmed)}`,
+    );
   }
 }
 

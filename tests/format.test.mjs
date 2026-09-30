@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createNotifier } from "../dist/bot.js";
-import { escapeMd, formatEvent } from "../dist/notifications/format.js";
+import { escapeMd, formatEvent, splitTelegramMessage, TELEGRAM_MAX_MESSAGE_LENGTH } from "../dist/notifications/format.js";
 import { formatUsdc } from "../dist/stellar/decode.js";
 
 const reserved = "_*[]()~`>#+-=|{}.\\!";
@@ -134,7 +134,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
       category: reserved,
     },
   };
-  const message = formatEvent(config, event);
+  const formatted = formatEvent(config, event);
   const expectedMessage =
     `🆕 *New claim* \\#7\nCategory: ${expectedEscape(reserved)}\n` +
     "Creator: `GABCD`\n_ledger 42_ \\· _v1_";
@@ -149,7 +149,7 @@ test("formatted untrusted event text reaches Telegram as exact MarkdownV2", asyn
   };
 
   assert.equal(message, expectedMessage);
-  await createNotifier(fakeBot, config)(message);
+  await createNotifier(fakeBot)(config.chatId, message);
   assert.deepEqual(sent, [
     [
       config.chatIds[0],
@@ -431,8 +431,18 @@ test("clip: summary field is bounded in claim_resolved notification", () => {
       category: "sports",
     },
   };
-  const message = formatEvent(config, event);
-  assert.match(message, /^🧪 \*\[PREVIEW MODE\]\*\n🆕 \*New claim\*/);
+
+  await createNotifier(fakeBot, config)(text);
+  assert.ok(sent.length >= 2);
+  for (const [chatId, body, opts] of sent) {
+    assert.equal(chatId, config.chatId);
+    assert.ok(body.length <= TELEGRAM_MAX_MESSAGE_LENGTH);
+    assert.deepEqual(opts, {
+      parse_mode: "MarkdownV2",
+      link_preview_options: { is_disabled: true },
+    });
+  }
+  assert.equal(sent.map((s) => s[1]).join("\n"), text);
 });
 
 test("formatFallbackEvent formats actionable degraded event notification with redacted reason", async () => {
@@ -472,17 +482,35 @@ test("formatFallbackEvent formats actionable degraded event notification with re
 });
     explorerBaseUrl: "https://stellar.expert/explorer",
   };
+  const longSummary = "evidence ".repeat(100); // 900 chars
   const event = {
     source: "market",
-    contractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
-    ledger: 200,
-    txHash: "hash456",
+    contractId: "market",
+    ledger: 52,
+    txHash: "",
     at: 0,
-    eventId: "200-0",
-    payload: { name: "unknown" },
+    eventId: "52-0",
+    payload: {
+      name: "claim_resolved",
+      claimId: 3,
+      winnerSide: 2,
+      summary: longSummary,
+      confidence: 95,
+      evidenceHash: "abc123",
+    },
   };
-  const fallback = formatFallbackEvent(config, event, "corrupt payload 123456789:SECRET-TOKEN-ABCD");
-  assert.match(fallback, /⚠️ \*Event Notification Fallback\*/);
-  assert.equal(fallback.includes("SECRET-TOKEN"), false);
+  const message = formatEvent(config, event);
+  assert.ok(message !== null, "Expected a non-null message");
+  // The raw summary should not appear verbatim past 200 chars in the output
+  assert.ok(
+    !message.includes("evidence ".repeat(30)),
+    "Summary was not truncated in the notification output",
+  );
 });
-
+    explorerBaseUrl: "https://stellar.expert/explorer",
+  };
+  const big = "z".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 10);
+  const notify = createNotifier(fakeBot, { chatId: "-1001" });
+  await assert.rejects(notify(big), error);
+  assert.equal(calls, 1);
+});

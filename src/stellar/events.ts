@@ -47,9 +47,11 @@ import {
   clampStartLedger,
   createRpcServer,
   LedgerWindowError,
+  validateContractId,
   validateLedgerWindow,
   type LedgerWindow,
 } from "./client.js";
+import type { LedgerTip } from "./ledger-cache.js";
 import {
   decodeEvent,
   dedupeEvents,
@@ -94,6 +96,13 @@ export interface ScanOptions {
    * disables deduplication. Defaults to {@link DEFAULT_DEDUP_WINDOW}.
    */
   dedupWindow?: number | undefined;
+  /**
+   * Chain tip cached by the caller for this poll cycle. When set the walk does
+   * not call `getHealth()`; the caller owns refreshing it per cycle (see
+   * {@link import("./ledger-cache.js").LedgerCache}). Omitted means a one-shot
+   * scan — the `scan` CLI, a test — fetches its own tip.
+   */
+  ledgerTip?: LedgerTip | undefined;
 }
 
 export interface RawScan {
@@ -130,6 +139,9 @@ export interface RawScan {
   timing: RpcTimingSummary;
 }
 
+const MAX_UINT32 = 4_294_967_295n;
+const MAX_UINT64 = 18_446_744_073_709_551_615n;
+
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
  * high 32 bits. Reading it lets the walk know it reached the end of the range
@@ -142,10 +154,19 @@ export interface RawScan {
  */
 export function eventCursorLedger(cursor: string): number | null {
   if (typeof cursor !== "string") return null;
-  const toid = cursor.split("-")[0];
-  if (!toid || !/^\d+$/.test(toid)) return null;
+  const match = /^(\d+)-(\d+)$/.exec(cursor);
+  if (!match) return null;
+
+  const toidText = match[1];
+  const indexText = match[2];
+  if (toidText === undefined || indexText === undefined) return null;
+  if (toidText.length > 20 || indexText.length > 10) return null;
+
   try {
-    return Number(BigInt(toid) >> 32n);
+    const toid = BigInt(toidText);
+    const index = BigInt(indexText);
+    if (toid > 18_446_744_073_709_551_615n || index > 4_294_967_295n) return null;
+    return Number(toid >> 32n);
   } catch {
     return null;
   }
@@ -202,9 +223,17 @@ export async function paginatedGetEvents(
   const dedup = new EventDedupWindow(opts.dedupWindow ?? DEFAULT_DEDUP_WINDOW);
   for (const id of opts.seenEventIds ?? []) dedup.add(id);
 
-  const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
-  let lastCursor: string | null = opts.cursor ?? null;
+  if (cursor) {
+    const cLedger = eventCursorLedger(cursor);
+    if (cLedger !== null && cLedger < oldestLedger) {
+      console.error(`[scanner] cursor ledger ${cLedger} is older than retained window ${oldestLedger}, discarding`);
+      cursor = undefined;
+    }
+  }
+
+  const events: rpc.Api.EventResponse[] = [];
+  let lastCursor: string | null = cursor ?? null;
   let previousCursor = "";
   let latestLedger = window.latestLedger;
   let truncated = false;
@@ -240,6 +269,7 @@ export async function paginatedGetEvents(
   }
 
   const firstStartLedger = startLedger ?? window.oldestLedger;
+  let emptyPages = 0;
 
   for (;;) {
     if (pages >= maxPages) {
@@ -256,6 +286,8 @@ export async function paginatedGetEvents(
         : server.getEvents({ filters, startLedger: firstStartLedger, limit }),
     );
 
+    if (response.events.length === 0) emptyPages += 1;
+    latestLedger = response.latestLedger;
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
     // Drop anything an earlier page (or an earlier cycle) already produced.
     // Order is preserved: the first occurrence wins, matching the RPC's own
@@ -289,6 +321,7 @@ export async function paginatedGetEvents(
     oldestLedger,
     truncated,
     pages,
+    emptyPages,
     duplicates,
     seenEventIds: dedup.toJSON(),
     startLedger,
@@ -300,22 +333,28 @@ export async function paginatedGetEvents(
 export interface WatchTarget {
   source: ContractSource;
   contractId: string;
+  version?: string;
 }
 
 export interface ContractScan extends Omit<RawScan, "events"> {
   source: ContractSource;
   contractId: string;
+  version: string;
   events: DecodedEvent[];
   /** Highest ledger among the returned events, or null when there were none. */
   lastEventLedger: number | null;
 }
 
-/** Scan one contract and decode everything it returned. */
+/** Scan one contract and decode everything it returned for the configured version. */
 export async function readContractEvents(
   server: rpc.Server,
   target: WatchTarget,
   opts: ScanOptions = {},
 ): Promise<ContractScan> {
+  // Validate contract ID at scan time so misconfigurations surface early
+  // with an actionable error tied to the specific target.
+  validateContractId(target.contractId, `${target.source} contract ID`);
+
   const scan = await paginatedGetEvents(
     server,
     [{ type: "contract", contractIds: [target.contractId] }],
@@ -341,6 +380,7 @@ export async function readContractEvents(
   return {
     source: target.source,
     contractId: target.contractId,
+    version,
     events,
     cursor: scan.cursor,
     latestLedger: scan.latestLedger,
@@ -571,6 +611,10 @@ export async function runAuditCli(): Promise<void> {
 function summarize(event: DecodedEvent): string {
   const p = event.payload;
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
+  const text = (value: string, max = 200): string => {
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+  };
   switch (p.name) {
     case "claim_created":
       return `claim #${p.claimId} created by ${shortAddress(p.creator)} [${p.category}]`;
@@ -606,6 +650,14 @@ function summarize(event: DecodedEvent): string {
       if (isAdminPayload(p)) return `admin event ${p.name}`;
       return p.name;
   }
+}
+
+function boundedJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
+    const compact = item.replace(/\s+/g, " ").trim();
+    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
+  });
 }
 
 async function main(): Promise<void> {
@@ -686,7 +738,7 @@ async function main(): Promise<void> {
     const counts = eventHistogram(scan.events);
 
     console.log(
-      `pages=${scan.pages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
+      `pages=${scan.pages} emptyPages=${scan.emptyPages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
         `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
         `start=${scan.startLedger ?? "cursor"}${scan.startClamped ? " (clamped)" : ""}`,
     );

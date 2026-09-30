@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createBot, healthMessage, registerCommands } from "../dist/bot.js";
+import { createBot, registerCommands } from "../dist/bot.js";
 import { buildHealthReport, startHealthServer } from "../dist/health.js";
 
 function baseConfig(overrides = {}) {
   return {
+    version: "0.1.0",
     marketContractId: "CDV6JXIJCALSXQELCS6YUEWJWG5DFXQK5PJ5I7MWI6KVMQJBC5DLPKZI",
     squadContractId: "CBPGVXHXLULUBVZ24D6XNSUX7NH45HYXGWHAJFWTBHXYNO72KDRKCDFY",
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -18,6 +19,9 @@ function baseConfig(overrides = {}) {
     startLookbackLedgers: 60,
     cursorFile: "./data/cursor.json",
     maxNotificationsPerCycle: 20,
+    deadLetterFile: "./data/dead-letter.json",
+    deadLetterMax: 100,
+    deadLetterMaxAttempts: 10,
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
@@ -41,6 +45,7 @@ function baseStatus(overrides = {}) {
     notificationsSent: 2,
     notificationsFailed: 0,
     eventsSkipped: 1,
+    deadLetter: { depth: 0, enqueued: 0, replayed: 0, dropped: 0 },
     consecutiveFailures: 0,
     lastError: null,
     targets: [
@@ -485,4 +490,3 @@ test("registerCommands registers /health command with setMyCommands", async () =
   assert.ok(healthCmd);
   assert.equal(healthCmd.description, "Health assessment and operational readiness");
 });
-

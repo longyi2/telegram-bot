@@ -464,7 +464,7 @@ test("clean checkout: mock RPC, poller, and health server start without credenti
       const health = startHealthServer({ config: pollerConfig, status: () => poller.status() });
 
       await poller.start();
-      
+
       // Wait for the first successful cycle to complete.
       const deadline = Date.now() + 30_000;
       while (Date.now() < deadline) {
@@ -472,7 +472,7 @@ test("clean checkout: mock RPC, poller, and health server start without credenti
         if (s.cycles >= 1 && s.lastSuccessAt !== null) break;
         await new Promise((r) => setTimeout(r, 100));
       }
-      
+
       const status = poller.status();
       assert.ok(status.cycles >= 1, "poller should complete at least one cycle");
       assert.ok(status.lastSuccessAt !== null, "first cycle should succeed");

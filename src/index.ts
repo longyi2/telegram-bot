@@ -20,6 +20,7 @@ import {
 import { formatFeatureFlags } from "./notifications/featureFlags.js";
 import { auditEntry, createAuditLog } from "./audit.js";
 import { InstanceLockError } from "./instanceLock.js";
+import { Logger } from "./logger.js";
 import { createBot, createNotifier, registerCommands, type SendExtra } from "./bot.js";
 import { startHealthServer } from "./health.js";
 import { createPoller, waitForStartupHealth } from "./poller.js";
@@ -39,13 +40,19 @@ function installProcessHandlers(): void {
   // A rejected promise nobody awaited is a bug, but not a reason to stop
   // notifying. Log it and let the poll loop carry on.
   process.on("unhandledRejection", (reason) => {
-    console.error(`[error] unhandled rejection: ${safeErrorMessage(reason)}`);
+    Logger.error("process", `[error] unhandled rejection: ${safeErrorMessage(reason)}`, {
+      action: "unhandled_rejection",
+    });
   });
 
   // An uncaught exception means state is unknown; exit so the supervisor
   // restarts us. The persisted cursor is what makes that cheap.
   process.on("uncaughtException", (err) => {
-    console.error(`[fatal] uncaught exception, exiting for restart: ${safeErrorMessage(err)}`);
+    Logger.fatal(
+      "process",
+      `[fatal] uncaught exception, exiting for restart: ${safeErrorMessage(err)}`,
+      { action: "uncaught_exception" },
+    );
     process.exit(1);
   });
 }
@@ -107,9 +114,11 @@ async function main(): Promise<void> {
   // the placeholder token.
   const profile = activeProfileName();
   if (profile !== null) {
-    console.warn(
+    Logger.warn(
+      "boot",
       `[boot] MIMIR_PROFILE=${profile} is set: this entry still talks to real Telegram; ` +
         `use "npm run mock:poll" for a credential-free dry run`,
+      { profile },
     );
   }
 
@@ -132,18 +141,25 @@ async function main(): Promise<void> {
   console.log(`[boot] shutdown     ${config.shutdownTimeoutMs}ms drain budget`);
   console.log(
     `[boot] operator      ${config.operatorTelegramUserId === null ? "disabled" : "configured"}`,
+    { operatorConfigured: config.operatorTelegramUserId !== null },
   );
-  console.log(
+  Logger.info(
+    "boot",
     `[boot] preview mode  ${config.channelPreviewMode ? "enabled" : "disabled"}`,
+    { channelPreviewMode: config.channelPreviewMode },
   );
 
   // Which setting came from where, then anything an operator can act on. Names
   // and origins only: a value never reaches this log, so a boot log can be
   // pasted into a ticket without redaction.
   const provenance = configProvenance();
-  console.log(`[boot] config       ${formatProvenanceSummary(provenance)}`);
+  // `ConfigProvenance` is value-free by construction — setting names and where
+  // each came from, never a value — so the whole record is safe to log.
+  Logger.info("boot", `[boot] config       ${formatProvenanceSummary(provenance)}`, {
+    provenance,
+  });
   for (const warning of provenance.warnings) {
-    console.warn(`[boot] config       ${warning}`);
+    Logger.warn("boot", `[boot] config       ${warning}`, { warning });
   }
 
   // ── Metrics ────────────────────────────────────────────────────────────────
@@ -167,6 +183,7 @@ async function main(): Promise<void> {
   }
 
   const server = createRpcServer(config);
+  const server = await createRpcServer(config);
 
   // Bounded retries before announcing readiness: a briefly unavailable RPC
   // (deploy race, Testnet blip) should not fail the whole boot, but a wrong
@@ -175,10 +192,32 @@ async function main(): Promise<void> {
     deadlineMs: config.startupHealthDeadlineMs,
     retryMs: config.startupHealthRetryMs,
   });
-  console.log(
+  Logger.info(
+    "boot",
     `[boot] rpc ok (attempts=${health.attempts}), status=${health.status} ` +
       `ledgers ${health.oldestLedger}..${health.latestLedger}`,
+    {
+      action: "rpc_health",
+      attempts: health.attempts,
+      status: health.status,
+      oldestLedger: health.oldestLedger,
+      latestLedger: health.latestLedger,
+    },
   );
+
+  // Verify that the RPC's network passphrase matches the configured value.
+  // This is a safety-critical check: a mismatch indicates either the RPC is
+  // pointed at the wrong network, or the configuration is wrong. Fail fast
+  // rather than silently emitting notifications on the wrong network.
+  try {
+    await validateNetworkPassphrase(server, config);
+    console.log(`[boot] network passphrase verified`);
+  } catch (err) {
+    console.error(
+      `[fatal] network passphrase verification failed: ${safeErrorMessage(err)}`,
+    );
+    process.exit(1);
+  }
 
   // The bot needs the poller's status and the poller needs the bot's send path,
   // so one edge of the cycle is late-bound. This one, because it is the only
@@ -208,7 +247,7 @@ async function main(): Promise<void> {
     pause: () => poller.pause(),
     resume: () => poller.resume(),
   });
-  notify = createNotifier(bot, config);
+  notify = createNotifier(bot);
 
   // Local-only health HTTP for supervisors. Starts before Telegram long-poll
   // so a deploy probe can see the process even while grammy is connecting.
@@ -229,12 +268,18 @@ async function main(): Promise<void> {
   // token itself cannot authenticate, which no amount of waiting fixes.
   void bot
     .start({
-      onStart: (me) => console.log(`[boot] telegram ok, running as @${me.username}`),
+      onStart: (me) =>
+        Logger.info("boot", `[boot] telegram ok, running as @${me.username}`, {
+          telegramOk: true,
+          username: me.username,
+        }),
     })
     .catch((err: unknown) => {
-      console.error(
+      Logger.fatal(
+        "boot",
         `[fatal] telegram long-polling failed — check BOT_TOKEN: ` +
           safeErrorMessage(err, [config.botToken]),
+        { action: "telegram_start_failed" },
       );
       void poller.stop().finally(() => process.exit(1));
     });
@@ -257,11 +302,14 @@ async function main(): Promise<void> {
     const stopMetrics = metricsServer ? metricsServer.close() : Promise.resolve();
     void Promise.all([stopBot, stopMetrics]);
     if (shuttingDown) {
-      console.warn(`[shutdown] ${signal} received again during drain; forcing exit`);
+      Logger.warn("shutdown", `[shutdown] ${signal} received again during drain; forcing exit`, {
+        signal,
+        forced: true,
+      });
       process.exit(signal === "SIGINT" ? 130 : 143);
     }
     shuttingDown = true;
-    console.log(`[shutdown] ${signal} received, draining`);
+    Logger.info("shutdown", `[shutdown] ${signal} received, draining`, { signal });
 
     // A clean-stop marker closes the audit window: anything after it belongs to
     // the next run, which is how an operator tells a crash from a restart.
@@ -273,8 +321,10 @@ async function main(): Promise<void> {
     // here has already persisted state. Unref'd: it never delays a clean exit.
     const teardownBudgetMs = config.shutdownTimeoutMs + 10_000;
     const watchdog: NodeJS.Timeout = setTimeout(() => {
-      console.warn(
+      Logger.warn(
+        "shutdown",
         `[shutdown] teardown still running after ${teardownBudgetMs}ms; exiting without it`,
+        { teardownBudgetMs, action: "teardown_timeout" },
       );
       process.exit(1);
     }, teardownBudgetMs);
@@ -283,25 +333,41 @@ async function main(): Promise<void> {
     void (async () => {
       try {
         const result = await poller.shutdown();
-        console.log(
+        Logger.info(
+          "shutdown",
           `[shutdown] poller ${result.drained ? "drained" : "hit the drain deadline"}; ` +
             `cursor ${result.flushed ? "flushed" : "flush failed"} after ${result.waitedMs}ms`,
+          {
+            drained: result.drained,
+            cursorFlushed: result.flushed,
+            waitedMs: result.waitedMs,
+          },
         );
       } catch (err: unknown) {
-        console.error(`[shutdown] poller drain failed: ${safeErrorMessage(err)}`);
+        Logger.error(
+          "shutdown",
+          `[shutdown] poller drain failed: ${safeErrorMessage(err)}`,
+          { action: "drain_failed" },
+        );
       }
 
       try {
         await healthServer.close();
       } catch (err: unknown) {
-        console.error(`[shutdown] health server close failed: ${safeErrorMessage(err)}`);
+        Logger.error(
+          "shutdown",
+          `[shutdown] health server close failed: ${safeErrorMessage(err)}`,
+          { action: "health_close_failed" },
+        );
       }
 
       try {
         await bot.stop();
       } catch (err: unknown) {
-        console.error(
+        Logger.error(
+          "shutdown",
           `[shutdown] telegram stop failed: ${safeErrorMessage(err, [config.botToken])}`,
+          { action: "telegram_stop_failed" },
         );
       }
 
@@ -317,9 +383,14 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   if (err instanceof ConfigError || err instanceof InstanceLockError) {
-    console.error(`\n${err.message}\n`);
+    Logger.error("boot", `\n${err.message}\n`, {
+      action: "config_error",
+      problems: err instanceof ConfigError ? err.problems : undefined,
+    });
     process.exit(1);
   }
-  console.error(`[boot] startup failed: ${safeErrorMessage(err)}`);
+  Logger.error("boot", `[boot] startup failed: ${safeErrorMessage(err)}`, {
+    action: "startup_failed",
+  });
   process.exit(1);
 });

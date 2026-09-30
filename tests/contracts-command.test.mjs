@@ -82,23 +82,24 @@ test("contractsMessage renders both contract ids, testnet explorer links, and th
       "\n" +
       "Read\\-only: this bot holds no signing keys and cannot submit transactions\\.\n" +
       "\n" +
-      "*mimir\\-market*\n" +
+      "*mimir\\-market* \\(v1\\)\n" +
       `\`${MARKET_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${MARKET_ID})\n` +
       "\n" +
-      "*mimir\\-squad*\n" +
+      "*mimir\\-squad* \\(v1\\)\n" +
       `\`${SQUAD_ID}\`\n` +
       `[View on stellar\\.expert](https://stellar.expert/explorer/testnet/contract/${SQUAD_ID})`,
   );
 });
 
-test("contractsMessage switches to the public explorer on the public network passphrase", () => {
+test("contractsMessage switches to the public explorer on mainnet", () => {
   const config = fakeConfig({
+    network: "mainnet",
     networkPassphrase: "Public Global Stellar Network ; September 2015",
   });
   const message = contractsMessage(config);
 
-  assert.match(message, /Mimir on Stellar public/);
+  assert.match(message, /Mimir on Stellar mainnet/);
   assert.match(
     message,
     new RegExp(`stellar\\.expert/explorer/public/contract/${MARKET_ID}`),

@@ -19,6 +19,8 @@ import { redactText } from "./redact.js";
 export interface HealthDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Bounded redacted log ring; when absent or disabled, /health/diag 404s. */
+  logs?: LogCapture;
   /** Optional clock for deterministic tests. */
   now?: () => number;
   /**
@@ -41,6 +43,8 @@ export interface HealthReport {
   ok: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
+  /** Semver string from `package.json`, or `"unknown"` if unavailable. */
+  version: string;
   network: string;
   uptimeMs: number;
   checkedAt: string;
@@ -52,6 +56,8 @@ export interface HealthReport {
     stopping: boolean;
     channelPreviewMode: boolean;
     cycles: number;
+    /** Correlation ID for the most recently started poll cycle. */
+    lastCorrelationId: string | null;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
     latestLedger: number | null;
@@ -73,8 +79,29 @@ export interface HealthReport {
     notificationsDropped: number;
     /** Cursors automatically rewound to the RPC's retained floor this run. */
     cursorRewinds: number;
+    /**
+     * Bounded queue of sends that exhausted their retries and are waiting to
+     * be replayed. Counts only: no message text, no destination.
+     */
+    deadLetter: { depth: number; enqueued: number; replayed: number; dropped: number };
     consecutiveFailures: number;
+    /** Repetitive error lines summarized rather than printed since start. */
+    suppressedLogs: number;
     lastError: { at: string; message: string } | null;
+    /** Restart gaps detected since this process started. */
+    restartGaps: number;
+    /**
+     * The most recent resume position that fell below the RPC's retained
+     * window. The events it skipped are unrecoverable; this is what made them
+     * visible. Ledger numbers only — never a token or a remote payload.
+     */
+    lastRestartGap: {
+      at: string;
+      source: string;
+      cursorLedger: number;
+      oldestLedger: number;
+      missedLedgers: number;
+    } | null;
     /**
      * In-memory cursor state that is not on disk yet. False after a successful
      * flush, which is what a shutdown is for.
@@ -83,11 +110,18 @@ export interface HealthReport {
     lastFlushAt: string | null;
     targets: Array<{
       source: string;
+      version: string;
       /** Public contract id (on-chain). */
       contractId: string;
       lastEventLedger: number | null;
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
+      /** Ledgers lost to the retained window at this target's last restart gap. */
+      gapLedgers: number;
+      /** When this target's stale cursor was last rewound, or null. */
+      cursorResetAt: string | null;
+      /** A cursor is persisted but no ledger can be read out of it. */
+      cursorUnreadable: boolean;
       /** Ledger a target is resuming from after a floor rewind, or null. */
       rewindFromLedger: number | null;
       /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
@@ -98,6 +132,8 @@ export interface HealthReport {
       cursorStalled: boolean;
       hasError: boolean;
     }>;
+    persistentVolumeAvailable: boolean;
+    persistentVolumeError: string | null;
   };
   /**
    * Where configuration came from: each setting's name and the source that
@@ -205,6 +241,7 @@ export function buildHealthReport(
     ok: status === "ok",
     status,
     service: "mimir-telegram-bot",
+    version: config.version,
     network: networkLabel(config),
     uptimeMs,
     checkedAt: new Date(nowMs).toISOString(),
@@ -214,6 +251,7 @@ export function buildHealthReport(
       stopping: poller.stopping === true,
       channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
+      lastCorrelationId: poller.lastCorrelationId ?? null,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,
@@ -226,17 +264,35 @@ export function buildHealthReport(
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
       notificationsDropped: poller.notificationsDropped ?? 0,
       cursorRewinds: poller.cursorRewinds ?? 0,
+      deadLetter: {
+        depth: poller.deadLetter?.depth ?? 0,
+        enqueued: poller.deadLetter?.enqueued ?? 0,
+        replayed: poller.deadLetter?.replayed ?? 0,
+        dropped: poller.deadLetter?.dropped ?? 0,
+      },
       consecutiveFailures: poller.consecutiveFailures,
+      suppressedLogs: poller.suppressedLogs ?? 0,
       lastError: poller.lastError
         ? {
             at: new Date(poller.lastError.at).toISOString(),
             message: redactText(poller.lastError.message),
           }
         : null,
+      restartGaps: poller.restartGaps ?? 0,
+      lastRestartGap: poller.lastRestartGap
+        ? {
+            at: new Date(poller.lastRestartGap.at).toISOString(),
+            source: poller.lastRestartGap.source,
+            cursorLedger: poller.lastRestartGap.cursorLedger,
+            oldestLedger: poller.lastRestartGap.oldestLedger,
+            missedLedgers: poller.lastRestartGap.missedLedgers,
+          }
+        : null,
       pendingFlush: poller.pendingFlush === true,
       lastFlushAt: iso(poller.lastFlushAt ?? null),
       targets: poller.targets.map((t) => ({
         source: t.source,
+        version: t.version ?? "v1",
         contractId: t.contractId,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
@@ -246,9 +302,78 @@ export function buildHealthReport(
         cyclesWithoutAdvance: t.cyclesWithoutAdvance,
         hasError: t.lastError !== null,
       })),
+      persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
+      persistentVolumeError: poller.persistentVolumeError ?? null,
     },
     config: provenance,
   };
+}
+
+/**
+ * Render poller status as Prometheus metrics.
+ */
+export function buildMetricsReport(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+): string {
+  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  const network = networkLabel(config);
+
+  const lines: string[] = [
+    `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
+    `# TYPE mimir_telegram_uptime_ms gauge`,
+    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
+    ``,
+    `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
+    `# TYPE mimir_telegram_poller_running gauge`,
+    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
+    ``,
+    `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
+    `# TYPE mimir_telegram_poller_cycles_total counter`,
+    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
+    ``,
+    `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
+    `# TYPE mimir_telegram_notifications_sent_total counter`,
+    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
+    ``,
+    `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
+    `# TYPE mimir_telegram_notifications_failed_total counter`,
+    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
+    ``,
+    `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
+    `# TYPE mimir_telegram_events_skipped_total counter`,
+    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    ``,
+    `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
+    `# TYPE mimir_telegram_consecutive_failures gauge`,
+    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+  ];
+
+  if (poller.latestLedger !== null) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
+      `# TYPE mimir_telegram_latest_ledger gauge`,
+      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+    );
+  }
+
+  const targetsWithLedgers = poller.targets.filter((t) => t.lastEventLedger !== null);
+  if (targetsWithLedgers.length > 0) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target`,
+      `# TYPE mimir_telegram_target_last_event_ledger gauge`,
+    );
+    for (const target of targetsWithLedgers) {
+      lines.push(
+        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
+      );
+    }
+  }
+
+  return lines.join("\\n") + "\\n";
 }
 
 function sendJson(
@@ -272,7 +397,7 @@ function sendJson(
  * useful for unit tests and one-shot CLI runs that must not bind a port.
  */
 export function startHealthServer(deps: HealthDeps): HealthServer {
-  const { config, status } = deps;
+  const { config, status, logs } = deps;
   const now = deps.now ?? Date.now;
   const provenance = deps.provenance ?? configProvenance;
 
@@ -303,8 +428,20 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         ok: true,
         status: "live",
         service: "mimir-telegram-bot",
+        version: config.version,
         checkedAt: new Date(now()).toISOString(),
       });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/metrics") {
+      const metrics = buildMetricsReport(config, status(), now());
+      res.writeHead(200, {
+        "content-type": "text/plain; version=0.0.4; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(metrics),
+      });
+      res.end(metrics);
       return;
     }
 
@@ -313,6 +450,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         service: "mimir-telegram-bot",
         health: "/health",
         live: "/health/live",
+        metrics: "/metrics",
       });
       return;
     }
@@ -330,7 +468,10 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const address = server.address() as AddressInfo | null;
   const port = address?.port ?? config.healthPort;
   const url = `http://${config.healthHost}:${port}`;
-  console.log(`[health] listening on ${url} (GET /health, GET /health/live)`);
+  console.log(
+    `[health] listening on ${url} (GET /health, GET /health/live` +
+      `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
+  );
 
   return {
     url,

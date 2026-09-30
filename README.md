@@ -34,7 +34,24 @@ it holds no keys and signs nothing.
 
 Admin events (`oracle_changed`, `ownership_transferred`, `fee_policy_*`,
 `fee_accrued`, `agent_attributed`) are decoded far enough to be recognised and
-then skipped — they are logged, not posted.
+then skipped — they are retained as bounded `unknown` events and logged with
+their event name, ledger, and bounded decode reason, not posted. New event names
+and malformed XDR follow the same path, so they cannot stop polling or advance a
+log with an unbounded remote payload.
+
+## Claim category filtering
+
+The notifier can be restricted to a subset of claim categories by setting an
+optional allowlist in `.env`:
+
+```bash
+NOTIFY_CATEGORIES=crypto,politics
+```
+
+When set, only `claim_created` events whose category matches an allowlisted name
+are sent to Telegram; all other notification types continue to flow normally.
+The default (unset or empty) preserves the current behaviour and notifies every
+claim category.
 
 ## Setup
 
@@ -506,6 +523,12 @@ somewhere else.
 This is suppression, not backfilling. A dropped duplicate does **not** hold the
 cursor back — the chain remains the record and the walk still advances.
 
+The poller exposes **empty-page telemetry** for this: cumulative and last-cycle
+counts of empty `getEvents` pages appear in `/status` and in each scan log line
+(`N page(s) (M empty)`). High empty-page ratios are expected on quiet contracts;
+a sudden drop to zero pages, or `truncated` without progress, is the signal to
+investigate RPC or `EVENT_MAX_PAGES`.
+
 Events are also not a source of truth for current state — a claim's stakes and
 status come from the contract's own getters. This bot is a timeline, not an
 index.
@@ -555,12 +578,39 @@ The poller now recovers from exactly that case, without guessing:
 - The miss is logged as a bounded ledger count (`cursor is N ledger(s) below the
   retained floor`), never as a raw RPC payload, and `/status` and `GET /health`
   expose `cursorRewinds` plus the per-target `rewindFromLedger` while it lasts.
+- **Detection does not wait for the rejection.** Before it asks for events, every
+  cycle places a resumed cursor against the floor the last successful scan proved,
+  so a position the RPC answers with an empty page instead of a stale error is
+  caught too - that case used to retry the same ledger forever without a line in
+  the logs. One comparison and no extra request, and it can only fire for a
+  position this build can place *strictly* below the floor.
 
 A recovery is observable: `/status` gains a `Cursors rewound to the retained
 floor: N` line once `cursorRewinds > 0`, and `status.json` reports the same
 counter and the active `rewindFromLedger`. The counter is per process, so it
 resets on restart; the position itself is persisted so a restart mid-recovery
 resumes from the same floor.
+
+### What a restart gap reports
+
+A position that is *provably* below the floor is a **restart gap**: the ledgers
+between it and the floor are gone for good. Main's recovery resumes from the
+floor, so the retained window is delivered late rather than dropped — but how
+much was lost, and when, is what an operator needs to see, and it is reported
+once per occurrence rather than once per cycle:
+
+- `/status` adds `restart gap: N ledgers unrecoverable, cursor reset <ago>` for
+  each affected target, and `Restart gaps detected since start: N` when a gap
+  has been seen.
+- `GET /health` adds `restartGaps`, a `lastRestartGap` object (`at`, `source`,
+  `cursorLedger`, `oldestLedger`, `missedLedgers`) and per-target `gapLedgers`,
+  `cursorResetAt` and `cursorUnreadable`.
+- The `/health` command adds the same summary and the per-target gap.
+
+A cursor whose ledger cannot be read out of the opaque token is **not** a gap: it
+is reported as `cursorUnreadable` and forwarded unchanged, because a token shape
+this build does not understand is not evidence that the RPC will reject it. Only
+a position this build can place strictly below the floor is a gap.
 
 ## Decoder compatibility contract
 
@@ -692,6 +742,7 @@ an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE`
 at one). On an ephemeral filesystem every restart is a cold start, and events
 that happened while the bot was down are never posted. Swapping this for a real
 KV store is a deliberate future step, not something this repo does today.
+**Deployment note:** a flat file is fine for v0 but it must survive restarts. At startup, the poller verifies persistent-volume availability and cursor-file permissions by testing write access to the configured `CURSOR_FILE` directory and read/write access to any existing cursor file. If persistent-volume or file-permission verification fails, the poller logs an actionable warning and falls back to in-memory cursor management without crashing, ensuring operational continuity while surfacing volume warnings via `/status` and `/health`. On an always-on host, put `data/` on a persistent volume (or point `CURSOR_FILE` at one). On an ephemeral filesystem every restart is a cold start, and events that happened while the bot was down are never posted. Swapping this for a real KV store is a deliberate future step, not something this repo does today.
 
 ## Single-instance lock
 
@@ -708,6 +759,8 @@ bot token or any secret.
   the lock survives the same restarts the cursor does.
 
 ## Failure behaviour
+
+For detailed operational behavior, deployment assumptions, and configuration tuning, see the [Configuration and Operational Reference](docs/configuration-reference.md).
 
 This process is meant to stay up for weeks, so a single failure never ends it:
 
@@ -734,11 +787,15 @@ This process is meant to stay up for weeks, so a single failure never ends it:
 - **A partial notification batch** commits the opaque RPC cursor after the
   returned page has been processed. Unknown events, events beyond
   `MAX_NOTIFICATIONS_PER_CYCLE`, and sends that exhaust three bounded retries
-  are counted as skipped or failed and are not replayed. Holding the cursor
-  back would turn a revoked token or removed chat into an infinite replay, and
-  recovery would flood the channel. A failed send is isolated to that routed
-  chat and event; other events continue. Notifications are lossy on purpose —
-  the chain is the record; the poller logs the sent/failed/skipped commit decision.
+  are counted as skipped or failed. Holding the cursor back would turn a
+  revoked token or removed chat into an infinite replay, so the cursor always
+  advances — but a send that exhausts its retries is parked in a bounded local
+  queue and replayed on a later cycle once Telegram recovers, so a rate limit or
+  a short outage costs a delay rather than the message. See
+  [Dead-letter queue](#dead-letter-queue). A failed send is isolated to that
+  routed chat and event; other events continue. Skips are lossy on purpose —
+  the chain is the record; the poller logs the sent/failed/skipped/parked
+  commit decision.
   A rejected inline keyboard (or a malformed MarkdownV2 payload) fails the same
   way as any other send. Events without a usable transaction hash are still
   sent, just without the explorer button.
@@ -746,10 +803,11 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   to `data/cursor.json.corrupt.<timestamp>` beside the live path, then treated as
   a cold start; the next successful cycle writes a fresh `cursor.json`, and the
   quarantined copy is kept for operators instead of being overwritten.
-- **A valid but RPC-rejected stale cursor** (one below the retained floor) is
-  rewound to that floor in bounded steps: the poller confirms the position
-  against a fresh `getHealth()`, drops the unreachable cursor, rescans from
-  `oldestLedger`, and records the recovery in `/status` and `status.json`. It
+- **A valid but stale cursor** (one below the retained floor) is caught before the
+  scan as well as on the RPC's own rejection, and rewound to that floor in bounded
+  steps: the poller confirms the position against a fresh `getHealth()`, drops the
+  unreachable cursor, rescans from `oldestLedger`, and records the recovery plus the
+  ledgers it lost in `/status`, `status.json` and `GET /health`. It
   never guesses — an opaque cursor, an ahead-of-tip cursor, or a window that
   cannot be read is left untouched and the bounded RPC error is surfaced. After
   `MAX_FLOOR_REWINDS` (3) consecutive rewinds for one contract the poller stops
@@ -785,6 +843,13 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   wrong local clock stay distinguishable. The clock is saved with the cursors,
   so a restart resumes it instead of reporting `unknown`, and an event without
   a `ledgerClosedAt` never counts as a chain time.
+- **A repeating failure** is logged through a sampler: the first
+  `LOG_SAMPLE_MAX_PER_WINDOW` identical errors in a `LOG_SAMPLE_WINDOW_MS`
+  window print in full, later repeats are counted, and the line that opens the
+  next window reports how many were held back. An RPC that is down for hours
+  therefore costs a handful of lines instead of one per cycle. The running total
+  is exposed as `poller.suppressedLogs` on `/health`; `/status` still shows the
+  latest error verbatim.
 - **An operator pause** prevents new cycles but cannot cancel a bounded scan or
   Telegram retry loop already in progress. That cycle follows the normal cursor
   rules above; `/resume` starts the next cycle immediately.
@@ -795,6 +860,41 @@ This process is meant to stay up for weeks, so a single failure never ends it:
   most `SHUTDOWN_TIMEOUT_MS` for the cycle in progress, and flushes any cursor
   state that is still only in memory — see
   [Graceful shutdown](#graceful-shutdown).
+
+### Dead-letter queue
+
+A send that fails every bounded retry is parked in `data/dead-letter.json`
+(`DEAD_LETTER_FILE`) instead of being dropped. The two failure modes are
+different: a rate limit or a short Telegram outage is a delay, while a revoked
+token is permanent, and the send site cannot tell them apart. Parked messages are
+replayed oldest-first at the start of a later cycle, under the same per-cycle
+budget as a normal burst, and the file is bounded on every axis:
+
+| Bound | Setting | Default | Behaviour when reached |
+| --- | --- | --- | --- |
+| Depth | `DEAD_LETTER_MAX` | `100` | the oldest parked send is dropped |
+| Attempts | `DEAD_LETTER_MAX_ATTEMPTS` | `10` | the entry is dropped as poison |
+| Message body | — | 4,000 chars | the stored text is truncated |
+| Recorded error | — | 200 chars | redacted (bot token), then truncated |
+
+Identity is the event, not the attempt: the same event failing twice is one
+entry with two attempts, so a failing cycle cannot fill the queue with
+duplicates. Only the already-formatted message and short operational metadata
+(source, ledger, event name, redacted error) are stored — never a signing key —
+and the file is written write-then-rename, so a crash cannot corrupt it.
+
+Two things it deliberately does not do:
+
+- **It never holds the cursor back.** The cursor advances exactly as it did
+  before, because a permanently broken destination must not stop the poller or
+  replay the chain forever.
+- **It never replays what a shutdown dropped.** A message that was never
+  attempted at `SIGTERM` is counted as dropped and left to the chain, so a
+  restart cannot resurrect a stale backlog into the channel.
+
+`/status` and `GET /health` report the queue's depth, replays and drops. Omitting
+`DEAD_LETTER_FILE` disables the queue entirely, and the poller then behaves
+exactly as it did before the queue existed.
 
 ## Graceful shutdown
 
@@ -842,6 +942,30 @@ Configuration is additive: `SHUTDOWN_TIMEOUT_MS` is optional (see
 format is unchanged — a deployment that omits the new key gets the `10000` ms
 default.
 
+## Log sampling
+
+Operational errors are sampled so a long outage cannot drown the log. Per key —
+`scan:market`, `scan:squad`, and `cycle` — the first `LOG_SAMPLE_MAX_PER_WINDOW`
+identical lines inside a `LOG_SAMPLE_WINDOW_MS` window are printed in full.
+Further repeats are counted, and the line that opens the next window reports how
+many it held back (`suppressed N identical repeats in the previous 300s`). The
+running total is exposed as `poller.suppressedLogs` on `/health`, so a sampled
+log still accounts for every failure. Keys are independent: a noisy market
+contract cannot silence the squad contract's errors, and the text itself is
+still bounded and redacted exactly as before.
+
+Configuration (see `.env.example`):
+
+- `LOG_SAMPLE_MAX_PER_WINDOW` — full lines per key per window (default `3`; `1` logs only the first line of a run)
+- `LOG_SAMPLE_WINDOW_MS` — window length in milliseconds (default `300000`; minimum `1000`)
+
+Sampling is in-memory and resets on restart. It changes log volume only — never
+cursors, sends, retry counts, or the `/status` error text.
+
+**Failure modes:** the sampler is pure bookkeeping keyed by string, so it cannot
+throw into the poll loop. **Rollback:** omit both keys to keep defaults, or raise
+`LOG_SAMPLE_MAX_PER_WINDOW` until nothing is suppressed.
+
 ## Long-running operation
 
 The notifier is meant to run for weeks through Stellar RPC and Telegram outages.
@@ -878,6 +1002,11 @@ truth, so nothing is replayed beyond the last saved cursor and nothing needs
 migrating. An older build that meets a mid-recovery file simply cold-starts that
 contract from `START_LOOKBACK_LEDGERS` rather than mis-reading it. Keep a copy of
 the cursor file if you want an exact resume point.
+- **A message over Telegram's 4096-character limit** is split on newlines (or
+  hard-split when a single line is oversized) and sent as ordered chunks. The
+  poller's send path and `/status` (and other MarkdownV2 replies) share this
+  splitter so a long status or a rare oversized event never fails with
+  "message is too long".
 
 ## Health endpoint
 
@@ -891,8 +1020,9 @@ checks (default `http://127.0.0.1:8787`):
 
 | Path | Meaning |
 | --- | --- |
-| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused`. |
+| `GET /health` (alias `/healthz`) | Readiness-style status. `200` when the poller is running and healthy, including an intentional operator pause; `503` when stopped or degraded (repeated RPC failures or a stale success window). The response includes `poller.paused` and `poller.suppressedLogs`. |
 | `GET /health/live` (alias `/livez`) | Liveness only — the process and HTTP server are up. Always `200` while listening. |
+| `GET /health/diag` | The same report `/export` produces in the chat, as plain text. `404` when log capture is off. For an operator with host access but no seat in the chat. |
 
 **Container Healthcheck:** A dedicated CLI probe is available for Docker `HEALTHCHECK` or Kubernetes `exec` probes. It reads the same environment variables and exits `0` on success:
 ```bash
@@ -902,7 +1032,9 @@ npm run healthcheck
 
 The JSON body is operational status only: poller counters, ledgers, truncated
 cursors, whether a target has an error, automatic floor rewinds
-(`poller.cursorRewinds` plus each target's `rewindFromLedger`), and the chain
+(`poller.cursorRewinds` plus each target's `rewindFromLedger`), restart gaps
+(`poller.restartGaps` and `poller.lastRestartGap`, plus each target's `gapLedgers`,
+`cursorResetAt` and `cursorUnreadable`), and the chain
 clock (`poller.chainClockAt` plus `poller.chainClockSkewMs`, the signed difference
 in milliseconds between the bot's clock and the newest chain close time it has
 observed — positive while the bot is ahead). Each target's `cursorStale` boolean
@@ -969,6 +1101,12 @@ Configuration (see `.env.example`):
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
 
+Each poll cycle gets a fresh UUID correlation ID. The ID is included in poller
+logs, `/status`, and `/health` so an RPC failure, malformed event, rate-limited
+send, or cycle error can be tied to one bounded cycle. It is not included in
+Telegram messages, persisted cursor data, or carried across a restart; the
+chain remains the source of truth.
+
 **Rollback:** set `HEALTH_PORT=0` (or omit the new env keys to keep defaults) and
 redeploy the previous image — the target alert is additive, does not change the
 version-1 cursor format or Telegram delivery, and the previous build safely
@@ -978,6 +1116,29 @@ ignores the new status field.
 exits via the listen error path after logging). Client disconnects and probe
 errors are logged and ignored so they cannot stop the notifier.
 - **Notification feature flags** (`NOTIFY_ENABLED`, `NOTIFY_MARKET`, `NOTIFY_SQUAD`) are coarse kill switches for Telegram posts. Disabled events are skip-logged and the cursor still advances; unset defaults keep prior always-on behavior.
+
+## Configuration and reliability
+
+### Network passphrase verification
+
+On startup, the bot verifies that the configured `STELLAR_NETWORK_PASSPHRASE`
+matches the RPC's own network passphrase (from `getNetwork()`). A mismatch is a
+configuration error and the process exits fail-fast, rather than silently reading
+events from the wrong chain. The error message names both the configured and
+actual passphrases so the mismatch is immediately actionable.
+
+### Link preview control
+
+Telegram can preview URLs in messages. The bot controls link previews per
+notification:
+
+- **Enabled** for events with transaction hashes in the footer, since explorer
+  links provide useful context about on-chain activity.
+- **Disabled** for command responses (status, help) and events without
+  transaction data, to keep the UI clean and avoid loading preview metadata.
+
+This is driven by the presence of a non-empty `txHash` field on each event, not
+configuration. All persisted state and cursor format remain unchanged.
 
 ## Layout
 
@@ -990,6 +1151,7 @@ src/
   bot.ts                   grammy setup: /start, /help, /status, /audit, /contracts, /health, /preview, operator pause/resume
   dedup.ts                 canonical event dedup keys (eventKey) + bounded window
   poller.ts                the loop: scan, notify, persist the cursor, flush audit
+  log-sampler.ts           windowed suppression of repetitive error log lines
   audit.ts                 redaction, bounded audit log, JSONL persistence, report renderer
   audit-cli.ts             entrypoint for `npm run audit`
   replay-cli.ts            entrypoint for `npm run replay` (cursor-range replay)
@@ -1009,6 +1171,8 @@ src/
 tests/
   format.test.mjs          notification formatting (incl. deterministic fuzz)
   audit.test.mjs           redaction, entries, persistence, report rendering
+  deadLetter.test.mjs      queue bounds, poison entries, redacted stored errors
+  poller-dlq.test.mjs      parking, replay after recovery, restart, disabled path
   replay.test.mjs          cursor-range replay: dry-run, send, clamp, security, cursor-safety
 ```
 
